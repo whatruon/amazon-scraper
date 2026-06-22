@@ -6,12 +6,81 @@ import logging
 import os
 import re
 import sys
-import tempfile
 from pathlib import Path
 
 from scraper import BrowserSession, ScrapeError, enrich_from_browser, parse_product
 
 log = logging.getLogger("scraper")
+
+
+def load_dotenv(path: Path = Path(".env")) -> None:
+    """Load KEY=VALUE lines from .env into os.environ (no overwrite)."""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+
+# Amazon marketplace domain -> manager profile name (each profile routes to the
+# matching marketplace with the right locale/timezone).
+DOMAIN_TO_PROFILE = {
+    "amazon.ae": "Amazon UAE",
+    "amazon.de": "Amazon DE",
+    "amazon.co.uk": "Amazon UK",
+    "amazon.com": "Amazon US",
+}
+
+
+def profile_for_url(url: str, profiles: list[dict]) -> tuple[str, str]:
+    """Pick the manager profile whose marketplace matches the URL's domain.
+
+    Returns (profile_id, profile_name); raises ValueError on an unknown domain
+    or a missing profile so a mismatched marketplace never scrapes wrong prices.
+    """
+    import urllib.parse
+
+    host = urllib.parse.urlparse(url).netloc.lower()
+    # Longest suffix first so amazon.co.uk wins over a hypothetical amazon.co.
+    for domain in sorted(DOMAIN_TO_PROFILE, key=len, reverse=True):
+        if host == domain or host.endswith("." + domain):
+            name = DOMAIN_TO_PROFILE[domain]
+            for p in profiles:
+                if p["name"] == name:
+                    return p["id"], name
+            raise ValueError(f"No manager profile named {name!r} for {domain}")
+    raise ValueError(f"Unsupported Amazon domain in URL: {host or url!r}")
+
+
+def list_profiles(base_url: str, api_key: str) -> list[dict]:
+    import urllib.request
+
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/api/profiles",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+def launch_manager_profile(base_url: str, api_key: str, profile_id: str):
+    """Launch a CloakBrowser-manager profile and return (cdp_url, headers)."""
+    import urllib.request
+
+    base = base_url.rstrip("/")
+    headers = {"Authorization": f"Bearer {api_key}"}
+    req = urllib.request.Request(
+        f"{base}/api/profiles/{profile_id}/launch", method="POST", headers=headers
+    )
+    try:
+        urllib.request.urlopen(req, timeout=60).read()
+    except urllib.error.HTTPError as e:
+        if e.code != 409:  # 409 = already running, which is fine
+            raise
+    return f"{base}/api/profiles/{profile_id}/cdp", headers
 
 
 def atomic_write(path: Path, content: str) -> None:
@@ -21,22 +90,22 @@ def atomic_write(path: Path, content: str) -> None:
 
 
 def main() -> None:
+    load_dotenv(Path(__file__).parent / ".env")
     parser = argparse.ArgumentParser(
         description="Scrape Amazon product details via CloakBrowser"
     )
     parser.add_argument("url", help="Amazon product URL (e.g. https://www.amazon.com/dp/B09XS7JWHH)")
     parser.add_argument("-o", "--output", help="Output JSON file path")
-    parser.add_argument("--headed", action="store_true", help="Show browser UI")
-    parser.add_argument("--proxy", help="Proxy URL (e.g. http://user:pass@host:port)")
-    parser.add_argument("--geoip", action="store_true", help="Auto-detect timezone/locale from proxy IP")
-    parser.add_argument("--humanize", action="store_true", help="Enable human-like mouse/keyboard/scroll")
-    parser.add_argument("--fingerprint", help="Fixed fingerprint seed for consistent identity")
-    parser.add_argument("--persistent", metavar="NAME", help="Use persistent profile (name for profile dir)")
-    parser.add_argument("--user-agent", help="Custom user agent string")
     parser.add_argument("--retries", type=int, default=3, help="Max retries on failure")
     parser.add_argument("--timeout", type=int, default=30000, help="Navigation timeout in ms")
     parser.add_argument("--wait", type=int, default=5000, help="Extra wait time after page load (ms)")
     parser.add_argument("--zip", help="Set delivery zip code (e.g. 90035)")
+    parser.add_argument("--manager", default=os.environ.get("CLOAK_MANAGER_URL"),
+                        help="CloakBrowser manager base URL (env: CLOAK_MANAGER_URL)")
+    parser.add_argument("--manager-key", default=os.environ.get("CLOAK_MANAGER_KEY"),
+                        help="Manager API key / Bearer token (env: CLOAK_MANAGER_KEY)")
+    parser.add_argument("--profile-id", default=os.environ.get("CLOAK_PROFILE_ID"),
+                        help="Override profile ID (default: auto-routed from the URL's Amazon domain)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
@@ -46,15 +115,25 @@ def main() -> None:
         stream=sys.stderr,
     )
 
-    session = BrowserSession(
-        headless=not args.headed,
-        humanize=args.humanize,
-        proxy=args.proxy,
-        geoip=args.geoip,
-        fingerprint=args.fingerprint,
-        user_agent=args.user_agent,
-        persistent=args.persistent,
+    if not (args.manager and args.manager_key):
+        parser.error("--manager and --manager-key are required "
+                     "(or set CLOAK_MANAGER_URL / CLOAK_MANAGER_KEY)")
+
+    profile_id = args.profile_id
+    if not profile_id:
+        try:
+            profile_id, name = profile_for_url(
+                args.url, list_profiles(args.manager, args.manager_key)
+            )
+        except ValueError as e:
+            parser.error(str(e))
+        if args.verbose:
+            log.info("Routed %s -> profile %s (%s)", args.url, name, profile_id)
+
+    cdp_url, cdp_headers = launch_manager_profile(
+        args.manager, args.manager_key, profile_id
     )
+    session = BrowserSession(cdp_url=cdp_url, cdp_headers=cdp_headers)
 
     page = None
 

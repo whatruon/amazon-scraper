@@ -17,8 +17,10 @@ def test_parse_sony_xm5():
     assert product.availability == "In Stock"
 
     assert len(product.images) == 3
-    assert product.images[0] == "https://m.media-amazon.com/images/I/31fEv99XZ+L._AC_US40_.jpg"
-    assert "SL1500" in product.images[1]
+    # size tokens stripped -> original full-resolution images
+    assert product.images[0] == "https://m.media-amazon.com/images/I/31fEv99XZ+L.jpg"
+    assert product.images[1] == "https://m.media-amazon.com/images/I/61O3iMlnJIL.jpg"
+    assert all("._AC_" not in u and "_US40_" not in u for u in product.images)
 
     assert len(product.bullets) == 2
     assert product.bullets[0] == "Premium noise cancellation technology"
@@ -88,3 +90,58 @@ def test_bullet_dedup():
     assert len(product.bullets) == 2
     assert product.bullets[0] == "Feature One"
     assert product.bullets[1] == "Feature Two"
+
+
+def test_price_normalizes_label_noise():
+    from scraper.parser import normalize_price
+    assert normalize_price("$275.00 with 5 percent off") == "$275.00"
+    assert normalize_price("List: $399.99") == "$399.99"
+    assert normalize_price("Currently unavailable") is None
+    assert normalize_price(None) is None
+
+
+def test_price_ignores_strikethrough_list_price():
+    # secondary (struck-through list) price appears first; price-to-pay must win
+    html = """
+    <html><body><div id="corePrice_feature_div">
+      <span class="a-price a-text-price" data-a-color="secondary">
+        <span class="a-offscreen">$349.99</span></span>
+      <span class="a-price priceToPay" data-a-color="base">
+        <span class="a-offscreen">$275.00</span></span>
+    </div></body></html>
+    """
+    assert parse_product(html).price == "$275.00"
+
+
+def test_full_size_image_strips_size_tokens():
+    from scraper.parser import full_size_image
+    base = "https://m.media-amazon.com/images/I/61O3iMlnJIL"
+    assert full_size_image(base + "._AC_SL1500_.jpg") == base + ".jpg"
+    assert full_size_image(base + "._AC_US40_.jpg") == base + ".jpg"
+    # video play-icon overlay thumbnail (no leading underscore)
+    assert full_size_image(base + ".SS40_BG85,85,85_BR-120_PKdp-play-icon-overlay__.jpg") == base + ".jpg"
+    # already full-size: unchanged
+    assert full_size_image(base + ".jpg") == base + ".jpg"
+
+
+def test_profile_for_url_routing():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "scrapercli", Path(__file__).parent.parent / "scraper.py"
+    )
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+
+    profiles = [
+        {"id": "ae", "name": "Amazon UAE"},
+        {"id": "de", "name": "Amazon DE"},
+        {"id": "uk", "name": "Amazon UK"},
+        {"id": "us", "name": "Amazon US"},
+    ]
+    assert cli.profile_for_url("https://www.amazon.com/dp/B09XS7JWHH", profiles)[0] == "us"
+    assert cli.profile_for_url("https://www.amazon.co.uk/dp/B0X", profiles)[0] == "uk"
+    assert cli.profile_for_url("https://www.amazon.de/dp/B0X", profiles)[0] == "de"
+    assert cli.profile_for_url("https://www.amazon.ae/dp/B0X", profiles)[0] == "ae"
+    import pytest
+    with pytest.raises(ValueError):
+        cli.profile_for_url("https://www.amazon.fr/dp/B0X", profiles)
