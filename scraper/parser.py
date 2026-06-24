@@ -11,19 +11,16 @@ from .models import Product
 log = logging.getLogger(__name__)
 
 PRICE_SELECTORS = [
+    "#corePrice_feature_div .a-offscreen",
+    "#corePrice_desktop .a-offscreen",
+    "#unifiedPrice_feature_div .a-offscreen",
+    "#corePriceDisplay_desktop_feature_div .aok-offscreen",
+    "#corePriceDisplay_desktop_feature_div .a-offscreen",
     "#apex-pricetopay-accessibility-label",
-    "#corePrice_feature_div .a-price .a-offscreen",
     "#priceblock_ourprice",
     "#priceblock_dealprice",
     "#price_inside_buybox",
-    ".a-price .a-offscreen",
-    ".a-offscreen",
 ]
-
-COUPON_PATTERNS = re.compile(
-    r"coupon|savings|subscribe|save\s+\$|-\$|with\s+coupon|clip\s+coupon",
-    re.IGNORECASE,
-)
 
 
 def _extract_price_from_soup(soup: BeautifulSoup) -> Optional[str]:
@@ -34,14 +31,12 @@ def _extract_price_from_soup(soup: BeautifulSoup) -> Optional[str]:
             if text:
                 return text
 
-    whole = soup.select_one(".a-price-whole")
-    if whole:
-        whole_text = whole.get_text(strip=True).rstrip(".")
-        fraction = soup.select_one(".a-price-fraction")
-        symbol = soup.select_one(".a-price-symbol")
-        frac = fraction.get_text(strip=True) if fraction else "00"
-        sym = symbol.get_text(strip=True) if symbol else "$"
-        return f"{sym}{whole_text}.{frac}"
+    for price_tag in soup.select(".a-price:not(.a-text-price)"):
+        off = price_tag.select_one(".a-offscreen")
+        if off:
+            text = off.get_text(strip=True)
+            if text and not price_tag.find_parent(lambda t: t.name == "div" and t.get("id", "").startswith("CardInstance")):
+                return text
 
     return None
 
@@ -49,31 +44,21 @@ def _extract_price_from_soup(soup: BeautifulSoup) -> Optional[str]:
 def _extract_price_from_browser(page) -> Optional[str]:
     js = """
     () => {
-        const selectors = [
-            '#apex-pricetopay-accessibility-label',
-            '#corePrice_feature_div .a-price .a-offscreen',
+        const containers = [
+            '#corePrice_feature_div',
+            '#corePrice_desktop',
+            '#unifiedPrice_feature_div',
+            '#corePriceDisplay_desktop_feature_div',
+            '#price_inside_buybox',
             '#priceblock_ourprice',
             '#priceblock_dealprice',
-            '#price_inside_buybox',
-            '.a-price .a-offscreen',
         ];
-        for (const sel of selectors) {
+        for (const sel of containers) {
             const el = document.querySelector(sel);
-            if (el && el.innerText.trim()) return el.innerText.trim();
-        }
-        const whole = document.querySelector('.a-price-whole');
-        if (whole) {
-            const sym = document.querySelector('.a-price-symbol');
-            const frac = document.querySelector('.a-price-fraction');
-            return (sym ? sym.innerText.trim() : '$') + whole.innerText.trim().replace(/\\.$/, '') + '.' + (frac ? frac.innerText.trim() : '00');
-        }
-        const dp = document.getElementById('dp') || document.getElementById('ppd') || document.querySelector('#centerCol, #leftCol');
-        if (dp) {
-            const matches = dp.innerText.match(/\\$\\d+(?:,\\d{3})*(?:\\.\\d{2})?/g);
-            if (matches) {
-                const nums = matches.map(m => parseFloat(m.replace(/[$,]/g, ''))).filter(n => n > 5);
-                if (nums.length) return '$' + Math.max(...nums).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
-            }
+            if (!el) continue;
+            const txt = el.innerText.trim();
+            const m = txt.match(/\\$\\d+(?:,\\d{3})*(?:\\.\\d{2})?/);
+            if (m) return m[0];
         }
         return null;
     }
@@ -125,26 +110,44 @@ def _extract_review_count(soup: BeautifulSoup) -> Optional[str]:
     return None
 
 
+MIN_IMAGE_SIZE = 200
+
+
+def _is_large_image(url: str) -> bool:
+    m = re.search(r"_(?:SX|SY|SL|SS|US|SR)(\d+)_", url)
+    if m:
+        return int(m.group(1)) >= MIN_IMAGE_SIZE
+    return True  # no size pattern in URL, keep it
+
+
 def _extract_images(soup: BeautifulSoup) -> list[str]:
     seen: set[str] = set()
     images: list[str] = []
 
-    for img in soup.select("#altImages img, #imgTagWrapperId img"):
+    # Search across both main image area and thumbnail strip
+    for img in soup.select("#imgTagWrapperId img, #main-image-container img, #altImages img, .imgTagWrapper img, #landingImage, #main-image"):
         for attr in ("data-old-hires", "src"):
             val = img.get(attr)
-            if val and val not in seen:
-                seen.add(val)
-                images.append(val)
+            if val and val not in seen and _is_large_image(val):
+                # Parse out the base image path to normalize size variants
+                base = re.sub(r"\._(AC|SX|SY|SL|SS|US|SR|FM|UX|V1|BG|PK)[^.]*_\.", ".", val)
+                if base not in seen:
+                    seen.add(base)
+                    seen.add(val)
+                    images.append(val)
 
-        dyn = img.get("data-a-dynamic-image")
+    # Also try data-a-dynamic-image on the wrappers
+    for container in soup.select("#imgTagWrapperId, #main-image-container, #altImages"):
+        dyn = container.get("data-a-dynamic-image")
         if dyn:
             try:
                 import json
                 parsed = json.loads(dyn)
-                urls = sorted(parsed.keys(), key=lambda u: parsed[u][0], reverse=True)
-                if urls and urls[0] not in seen:
-                    seen.add(urls[0])
-                    images.append(urls[0])
+                candidates = sorted(parsed.keys(), key=lambda u: parsed[u][0], reverse=True)
+                for url in candidates:
+                    if max(parsed[url]) > 500 and url not in seen:
+                        seen.add(url)
+                        images.append(url)
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -209,8 +212,10 @@ def parse_product(html: str, url: str = "") -> Product:
 
 def enrich_from_browser(product: Product, page) -> Product:
     if not product.price:
-        price = _extract_price_from_browser(page)
-        if price:
-            product.price = price
-            log.info("price filled from browser fallback: %s", price)
+        browser_price = _extract_price_from_browser(page)
+        if browser_price:
+            product.price = browser_price
+            log.info("price filled from browser: %s", browser_price)
+        else:
+            log.info("no price found from browser or HTML")
     return product

@@ -16,9 +16,9 @@ def test_parse_sony_xm5():
     assert product.asin == "B09XS7JWHH"
     assert product.availability == "In Stock"
 
-    assert len(product.images) == 3
-    assert product.images[0] == "https://m.media-amazon.com/images/I/31fEv99XZ+L._AC_US40_.jpg"
-    assert "SL1500" in product.images[1]
+    assert len(product.images) == 2
+    assert product.images[0] == "https://m.media-amazon.com/images/I/61O3iMlnJIL._AC_SL1500_.jpg"
+    assert product.images[1] == "https://m.media-amazon.com/images/I/61O3iMlnJIL._AC_SX679_.jpg"
 
     assert len(product.bullets) == 2
     assert product.bullets[0] == "Premium noise cancellation technology"
@@ -36,6 +36,7 @@ def test_parse_lenovo_legion():
     assert product.asin == "B0H1DXZ1VC"
     assert product.availability == "In Stock"
     assert len(product.images) == 1
+    assert product.images[0] == "https://m.media-amazon.com/images/I/81A7H1s3bJL._AC_SL1500_.jpg"
     assert len(product.bullets) == 3
 
 

@@ -4,14 +4,47 @@ import argparse
 import json
 import logging
 import os
+import random
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
+from urllib.parse import urlencode, parse_qs, urlparse
 
 from scraper import BrowserSession, ScrapeError, enrich_from_browser, parse_product
 
 log = logging.getLogger("scraper")
+
+AMAZON_TRACKING_PARAMS = {
+    "sbo", "tag", "ref", "ref_", "pf_rd_r", "pf_rd_p", "pf_rd_m",
+    "pf_rd_s", "pf_rd_t", "pf_rd_i", "linkCode", "linkId", "language",
+    "th", "psc", "smid", "coliid", "colid", "ie",
+}
+
+
+def _get_amazon_domain(url: str) -> str:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if "amazon" in host:
+        return host
+    return "amazon.com"
+
+
+def _clean_amazon_url(url: str) -> str:
+    """Remove tracking query params that can trigger CAPTCHA."""
+    parsed = urlparse(url)
+    if "amazon" not in parsed.netloc:
+        return url
+    qs = parse_qs(parsed.query, keep_blank_values=True)
+    clean_qs = {k: v for k, v in qs.items() if k not in AMAZON_TRACKING_PARAMS}
+    if clean_qs:
+        clean = parsed._replace(query=urlencode(clean_qs, doseq=True))
+    else:
+        clean = parsed._replace(query="")
+    return clean.geturl()
 
 
 def atomic_write(path: Path, content: str) -> None:
@@ -33,10 +66,10 @@ def main() -> None:
     parser.add_argument("--fingerprint", help="Fixed fingerprint seed for consistent identity")
     parser.add_argument("--persistent", metavar="NAME", help="Use persistent profile (name for profile dir)")
     parser.add_argument("--user-agent", help="Custom user agent string")
-    parser.add_argument("--retries", type=int, default=3, help="Max retries on failure")
-    parser.add_argument("--timeout", type=int, default=30000, help="Navigation timeout in ms")
-    parser.add_argument("--wait", type=int, default=5000, help="Extra wait time after page load (ms)")
-    parser.add_argument("--zip", help="Set delivery zip code (e.g. 90035)")
+    parser.add_argument("--retries", type=int, default=2, help="Max retries on failure")
+    parser.add_argument("--timeout", type=int, default=15000, help="Navigation timeout in ms")
+    parser.add_argument("--wait", type=int, default=0, help="Extra wait time after page load (ms)")
+    parser.add_argument("--zip", default="90035", help="Set delivery zip code (default: 90035)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
@@ -46,6 +79,7 @@ def main() -> None:
         stream=sys.stderr,
     )
 
+    domain = _get_amazon_domain(args.url)
     session = BrowserSession(
         headless=not args.headed,
         humanize=args.humanize,
@@ -54,29 +88,59 @@ def main() -> None:
         fingerprint=args.fingerprint,
         user_agent=args.user_agent,
         persistent=args.persistent,
+        domain=domain,
     )
 
     page = None
+    product = None
 
     try:
         session.start()
 
-        if args.zip:
-            zip_page = session.set_zip_code(args.zip, verbose=args.verbose)
-            if zip_page:
-                zip_page.close()
+        clean_url = _clean_amazon_url(args.url)
+        if clean_url != args.url and args.verbose:
+            log.info("Cleaned URL: %s", clean_url)
 
-        page = session.navigate_with_retry(
-            args.url,
-            retries=args.retries,
-            timeout=args.timeout,
-            wait=args.wait,
-            verbose=args.verbose,
-        )
+        for attempt in range(args.retries):
+            if page:
+                page.close()
 
-        html = page.content()
-        product = parse_product(html, url=args.url)
-        product = enrich_from_browser(product, page)
+            page = session.navigate_with_retry(
+                clean_url,
+                retries=args.retries,
+                timeout=args.timeout,
+                wait=args.wait,
+                verbose=args.verbose,
+            )
+
+            session.set_zip_code(page, zip_code=args.zip, verbose=args.verbose)
+
+            page.wait_for_timeout(1500)
+
+            html = page.content()
+            product = parse_product(html, url=args.url)
+            product = enrich_from_browser(product, page)
+
+            if product.price and product.asin:
+                break
+
+            missing = []
+            if not product.price:
+                missing.append("price")
+            if not product.asin:
+                missing.append("asin")
+            if args.verbose:
+                log.warning("Attempt %d/%d: missing %s, retrying...", attempt + 1, args.retries, ", ".join(missing))
+
+            if attempt < args.retries - 1:
+                time.sleep(2**attempt + random.uniform(0, 1))
+        else:
+            missing = []
+            if not product.price:
+                missing.append("price")
+            if not product.asin:
+                missing.append("asin")
+            raise ScrapeError(clean_url, f"missing {', '.join(missing)} after {args.retries} attempts", "parse")
 
         if args.verbose:
             log.info("URL: %s", args.url)

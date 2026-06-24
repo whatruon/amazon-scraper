@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -14,17 +15,56 @@ from .models import ScrapeError
 log = logging.getLogger(__name__)
 
 
+VIEWPORTS = [
+    {"width": 1920, "height": 1080},
+    {"width": 1366, "height": 768},
+    {"width": 1536, "height": 864},
+    {"width": 1440, "height": 900},
+    {"width": 1280, "height": 800},
+]
+
+TIMEZONE_LOCALE = [
+    ("America/New_York", "en-US"),
+    ("America/Chicago", "en-US"),
+    ("America/Denver", "en-US"),
+    ("America/Los_Angeles", "en-US"),
+]
+
+DOMAIN_LOCALE: dict[str, tuple[str, str]] = {
+    "amazon.ae": ("Asia/Dubai", "en-US"),
+    "amazon.co.uk": ("Europe/London", "en-US"),
+    "amazon.de": ("Europe/Berlin", "en-US"),
+    "amazon.fr": ("Europe/Paris", "en-US"),
+    "amazon.it": ("Europe/Rome", "en-US"),
+    "amazon.es": ("Europe/Madrid", "en-US"),
+    "amazon.ca": ("America/Toronto", "en-US"),
+    "amazon.co.jp": ("Asia/Tokyo", "en-US"),
+    "amazon.in": ("Asia/Kolkata", "en-US"),
+    "amazon.com.au": ("Australia/Sydney", "en-US"),
+    "amazon.com.br": ("America/Sao_Paulo", "en-US"),
+    "amazon.com.mx": ("America/Mexico_City", "en-US"),
+    "amazon.nl": ("Europe/Amsterdam", "en-US"),
+    "amazon.se": ("Europe/Stockholm", "en-US"),
+    "amazon.pl": ("Europe/Warsaw", "en-US"),
+    "amazon.sg": ("Asia/Singapore", "en-US"),
+    "amazon.eg": ("Africa/Cairo", "en-US"),
+    "amazon.sa": ("Asia/Riyadh", "en-US"),
+    "amazon.tr": ("Europe/Istanbul", "en-US"),
+}
+
+
 class BrowserSession:
     def __init__(
         self,
         headless: bool = True,
-        humanize: bool = False,
+        humanize: bool = True,
         proxy: Optional[str] = None,
         geoip: bool = False,
         fingerprint: Optional[str] = None,
         user_agent: Optional[str] = None,
         persistent: Optional[str] = None,
         profile_dir: Path = Path("profiles"),
+        domain: str = "amazon.com",
     ):
         self.headless = headless
         self.humanize = humanize
@@ -34,6 +74,7 @@ class BrowserSession:
         self.user_agent = user_agent
         self.persistent_name = persistent
         self.profile_dir = profile_dir
+        self.domain = domain
 
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
@@ -44,12 +85,35 @@ class BrowserSession:
             "headless": self.headless,
             "humanize": self.humanize,
         }
+        if self.humanize:
+            kwargs["human_preset"] = "careful"
+            kwargs["human_config"] = {
+                "typing_delay": 200,
+                "typing_delay_spread": 100,
+                "mouse_steps_divisor": 4,
+                "mouse_max_steps": 120,
+                "mouse_wobble_max": 3.0,
+                "mouse_overshoot_chance": 0.2,
+                "idle_between_actions": True,
+                "idle_between_duration": (1.0, 2.5),
+            }
+
+        dl = DOMAIN_LOCALE.get(self.domain)
+        if dl:
+            kwargs["timezone"] = dl[0]
+            kwargs["locale"] = dl[1]
+        else:
+            tz, locale = random.choice(TIMEZONE_LOCALE)
+            kwargs["timezone"] = tz
+            kwargs["locale"] = locale
+
         if self.proxy:
             kwargs["proxy"] = self.proxy
             if self.geoip:
                 kwargs["geoip"] = True
         if self.fingerprint:
-            kwargs["args"] = [f"--fingerprint={self.fingerprint}"]
+            kwargs.setdefault("args", [])
+            kwargs["args"].append(f"--fingerprint={self.fingerprint}")
 
         if self.persistent_name:
             profile_path = self.profile_dir / self.persistent_name
@@ -60,7 +124,7 @@ class BrowserSession:
             self.browser = launch(**kwargs)
             self.context = self.browser.new_context(
                 user_agent=self.user_agent,
-                viewport={"width": 1920, "height": 1080},
+                viewport=random.choice(VIEWPORTS),
             )
             self._owns_browser = True
 
@@ -73,83 +137,101 @@ class BrowserSession:
     def new_page(self) -> Page:
         return self.context.new_page()
 
-    def set_zip_code(self, zip_code: str, verbose: bool = False) -> Page:
-        page = self.new_page()
+    def set_zip_code(self, page: Page, zip_code: str = "90035", verbose: bool = False) -> None:
+        if self.domain != "amazon.com":
+            if verbose:
+                log.info("Skipping zip code for domain: %s", self.domain)
+            return
         try:
-            page.goto("https://www.amazon.com", wait_until="domcontentloaded", timeout=15000)
-            page.wait_for_timeout(3000)
+            line2 = page.query_selector("#glow-ingress-line2")
+            if line2:
+                text = line2.inner_text()
+                if re.search(r"\b\d{5}\b", text):
+                    if verbose:
+                        log.info("Zip code already set: %s", text.strip())
+                    return
 
-            trigger = page.query_selector("#nav-global-location-popover-link")
-            if trigger:
-                trigger.click()
-                page.wait_for_timeout(3000)
-            else:
-                if verbose:
-                    log.info("Location popover not found on homepage")
-                return page
-
-            inputs = page.query_selector_all(
-                "input.a-input-text, "
-                "input[aria-label*='zip' i], "
-                "input[aria-label*='code' i], "
-                "input[name*='zip'], "
-                ".a-popover-content input:not([type='hidden'])"
-            )
-            zip_input = None
-            for inp in inputs:
-                if inp.is_visible():
-                    zip_input = inp
-                    break
-
-            if not zip_input:
-                try:
-                    zip_input = page.wait_for_selector(
-                        "input:not([type='hidden']):not([type='submit']):not([type='button'])",
-                        timeout=3000,
-                    )
-                except Exception:
-                    pass
-
-            if zip_input:
-                try:
-                    zip_input.evaluate("el => el.click()")
-                except Exception:
-                    zip_input.click()
-                zip_input.fill("")
-                zip_input.type(zip_code, delay=50)
-                page.wait_for_timeout(1000)
-
-                apply_btn = page.query_selector(
-                    "button:has-text('Apply'), button:has-text('Done'), "
-                    "input[type='submit']"
-                )
-                if apply_btn:
-                    apply_btn.evaluate("el => el.click()")
+            toaster = page.query_selector(".glow-toaster")
+            if toaster and toaster.is_visible():
+                sub = toaster.query_selector(".glow-toaster-button-submit")
+                if sub:
+                    sub.click()
+                    page.wait_for_selector("#GLUXZipUpdateInput", timeout=5000)
                 else:
-                    page.keyboard.press("Enter")
-                page.wait_for_timeout(3000)
+                    d = toaster.query_selector(".glow-toaster-button-dismiss")
+                    if d:
+                        d.click()
+                        page.wait_for_timeout(500)
 
+            if not page.query_selector("#GLUXZipUpdateInput"):
+                trigger = page.query_selector("#nav-global-location-popover-link")
+                if not trigger:
+                    if verbose:
+                        log.warning("Location popover trigger not found")
+                    return
+                trigger.click()
+                try:
+                    page.wait_for_selector("#GLUXZipUpdateInput", timeout=5000)
+                except Exception:
+                    if verbose:
+                        log.warning("Zip input modal did not appear")
+                    return
+
+            zip_input = page.query_selector("#GLUXZipUpdateInput")
+            if not zip_input:
                 if verbose:
-                    log.info("Zip code set to %s on amazon.com", zip_code)
+                    log.warning("Zip input not found in modal")
+                return
+
+            zip_input.click()
+            zip_input.fill("")
+            zip_input.type(zip_code, delay=50)
+            page.wait_for_timeout(300)
+
+            apply_btn = page.query_selector("#GLUXZipUpdate input[type='submit']")
+            if not apply_btn:
+                apply_btn = page.query_selector("#GLUXZipUpdate")
+            if apply_btn:
+                apply_btn.click()
             else:
-                if verbose:
-                    log.warning("No visible input found in location modal")
+                page.keyboard.press("Enter")
 
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(2000)
+
+            error_el = page.query_selector("#GLUXZipError:not(.GLUX_Hidden)")
+            if error_el and error_el.is_visible():
+                if verbose:
+                    log.warning("Zip code validation error")
+                page.keyboard.press("Escape")
+                return
+
+            page.wait_for_timeout(1000)
+
+            done_btn = page.query_selector("button[name='glowDoneButton']")
+            if done_btn:
+                done_btn.click()
+            else:
+                close_btns = page.query_selector_all(".a-popover-footer button")
+                if close_btns:
+                    close_btns[-1].click()
+                else:
+                    page.keyboard.press("Escape")
+
+            page.wait_for_timeout(1500)
+
+            if verbose:
+                log.info("Zip code set to %s", zip_code)
 
         except Exception as e:
             if verbose:
                 log.warning("Could not set zip code: %s", e)
 
-        return page
-
     def navigate_with_retry(
         self,
         url: str,
-        retries: int = 3,
-        timeout: int = 30000,
-        wait: int = 5000,
+        retries: int = 2,
+        timeout: int = 15000,
+        wait: int = 0,
         verbose: bool = False,
     ) -> Page:
         last_exc: Optional[Exception] = None
@@ -157,16 +239,33 @@ class BrowserSession:
             page = self.new_page()
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-                page.wait_for_timeout(3000)
 
                 capthca_btn = page.query_selector("button[alt='Continue shopping']")
                 if capthca_btn:
                     if verbose:
                         log.info("CAPTCHA detected, clicking through...")
                     capthca_btn.click()
-                    page.wait_for_timeout(5000)
+                    try:
+                        page.wait_for_selector(
+                            "#productTitle, #dp, #centerCol",
+                            timeout=10000,
+                        )
+                    except Exception:
+                        pass
+                    return page
 
-                page.wait_for_timeout(wait)
+                # Wait for core product content, not a flat timeout
+                try:
+                    page.wait_for_selector(
+                        "#productTitle, #dp, #centerCol",
+                        timeout=5000,
+                    )
+                except Exception:
+                    pass
+
+                if wait:
+                    page.wait_for_timeout(wait)
+
                 return page
 
             except Exception as e:
