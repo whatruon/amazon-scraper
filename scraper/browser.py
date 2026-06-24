@@ -129,7 +129,7 @@ class BrowserSession:
             self._owns_browser = True
 
     def stop(self) -> None:
-        if self.context and not self.persistent_name:
+        if self.context:
             self.context.close()
         if self.browser and self._owns_browser:
             self.browser.close()
@@ -161,7 +161,7 @@ class BrowserSession:
                     d = toaster.query_selector(".glow-toaster-button-dismiss")
                     if d:
                         d.click()
-                        page.wait_for_timeout(500)
+                        page.wait_for_selector(".glow-toaster", state="hidden", timeout=5000)
 
             if not page.query_selector("#GLUXZipUpdateInput"):
                 trigger = page.query_selector("#nav-global-location-popover-link")
@@ -186,7 +186,7 @@ class BrowserSession:
             zip_input.click()
             zip_input.fill("")
             zip_input.type(zip_code, delay=50)
-            page.wait_for_timeout(300)
+            page.wait_for_selector("#GLUXZipUpdateInput", state="attached")
 
             apply_btn = page.query_selector("#GLUXZipUpdate input[type='submit']")
             if not apply_btn:
@@ -196,7 +196,7 @@ class BrowserSession:
             else:
                 page.keyboard.press("Enter")
 
-            page.wait_for_timeout(2000)
+            page.wait_for_selector("#GLUXZipUpdate", state="detached", timeout=10000)
 
             error_el = page.query_selector("#GLUXZipError:not(.GLUX_Hidden)")
             if error_el and error_el.is_visible():
@@ -205,7 +205,7 @@ class BrowserSession:
                 page.keyboard.press("Escape")
                 return
 
-            page.wait_for_timeout(1000)
+            page.wait_for_selector(".a-popover-inner, #GLUXZipUpdate", state="detached", timeout=5000)
 
             done_btn = page.query_selector("button[name='glowDoneButton']")
             if done_btn:
@@ -217,7 +217,7 @@ class BrowserSession:
                 else:
                     page.keyboard.press("Escape")
 
-            page.wait_for_timeout(1500)
+            page.wait_for_selector(".a-popover, #GLUXZipUpdateInput", state="hidden", timeout=5000)
 
             if verbose:
                 log.info("Zip code set to %s", zip_code)
@@ -242,6 +242,7 @@ class BrowserSession:
 
                 capthca_btn = page.query_selector("button[alt='Continue shopping']")
                 if capthca_btn:
+                    log.warning("CAPTCHA detected on page")
                     if verbose:
                         log.info("CAPTCHA detected, clicking through...")
                     capthca_btn.click()

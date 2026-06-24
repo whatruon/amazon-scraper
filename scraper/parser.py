@@ -173,10 +173,14 @@ def _extract_bullets(soup: BeautifulSoup) -> list[str]:
 def _extract_availability(soup: BeautifulSoup) -> Optional[str]:
     el = soup.select_one("#availability span")
     if el:
-        return el.get_text(strip=True)
+        text = el.get_text(strip=True)
+        if text:
+            return text
     el = soup.select_one("#deliveryBlockMessage")
     if el:
-        return el.get_text(strip=True)
+        text = el.get_text(strip=True)
+        if text:
+            return text
     return None
 
 
@@ -196,6 +200,64 @@ def _extract_asin(soup: BeautifulSoup, url: str) -> Optional[str]:
     return None
 
 
+def _extract_brand(soup: BeautifulSoup) -> Optional[str]:
+    # Try product details table
+    for row in soup.select("#productDetails_detailBullets_sections1 tr, #prodDetails tr, #productDetails_techSpec_section_1 tr"):
+        th = row.select_one("th, .a-span3")
+        if th and re.search(r"\bbrand\b", th.get_text(strip=True), re.IGNORECASE):
+            td = row.select_one("td, .a-span9")
+            if td:
+                return td.get_text(strip=True)
+    # Try brand link
+    el = soup.select_one("#bylineInfo")
+    if el:
+        return el.get_text(strip=True)
+    el = soup.select_one("a.brand-link, a[href*='/stores/brand/'], #po-brand .a-span2")
+    if el:
+        return el.get_text(strip=True)
+    # Try brand from product overview
+    for row in soup.select("#productOverview_feature_div tr, .po-brand"):
+        th = row.select_one("td:first-child, .a-span3")
+        if th and re.search(r"\bbrand\b", th.get_text(strip=True), re.IGNORECASE):
+            td = row.select_one("td:nth-child(2), .a-span9")
+            if td:
+                return td.get_text(strip=True)
+    return None
+
+
+def parse_search_results(html: str) -> list[str]:
+    """Parse Amazon search results page and return a list of product URLs."""
+    soup = BeautifulSoup(html, "lxml")
+    urls: list[str] = []
+
+    for card in soup.select('[data-component-type="s-search-result"]'):
+        link = card.select_one("h2 a.a-link-normal, h2 a.a-text-normal")
+        if not link:
+            link = card.select_one("a.a-link-normal.s-link-style")
+        if link:
+            href = link.get("href", "")
+            if href and "/dp/" in href:
+                # Strip tracking query parameters
+                clean = re.sub(r"\?.*$", "", href)
+                if clean.startswith("/"):
+                    clean = "https://www.amazon.com" + clean
+                elif not clean.startswith("http"):
+                    clean = "https://www.amazon.com/" + clean.lstrip("/")
+                if clean not in urls:
+                    urls.append(clean)
+
+    # Also extract from pagination links if present
+    for a in soup.select("a.s-pagination-item"):
+        href = a.get("href", "")
+        if href and "/s?" in href:
+            if not href.startswith("http"):
+                href = "https://www.amazon.com" + href
+            # We don't add pagination URLs to the result list;
+            # the caller can use these to fetch more result pages.
+
+    return urls
+
+
 def parse_product(html: str, url: str = "") -> Product:
     soup = BeautifulSoup(html, "lxml")
     return Product(
@@ -207,6 +269,7 @@ def parse_product(html: str, url: str = "") -> Product:
         bullets=_extract_bullets(soup),
         availability=_extract_availability(soup),
         asin=_extract_asin(soup, url),
+        brand=_extract_brand(soup),
     )
 
 

@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import urlencode, parse_qs, urlparse
 
 from scraper import BrowserSession, ScrapeError, enrich_from_browser, parse_product
+from scraper.search import search_amazon
 
 log = logging.getLogger("scraper")
 
@@ -57,7 +58,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Scrape Amazon product details via CloakBrowser"
     )
-    parser.add_argument("url", help="Amazon product URL (e.g. https://www.amazon.com/dp/B09XS7JWHH)")
+    parser.add_argument("url", help="Amazon product URL (e.g. https://www.amazon.com/dp/B09XS7JWHH) or search term (with -s/--search)")
     parser.add_argument("-o", "--output", help="Output JSON file path")
     parser.add_argument("--headed", action="store_true", help="Show browser UI")
     parser.add_argument("--proxy", help="Proxy URL (e.g. http://user:pass@host:port)")
@@ -71,6 +72,8 @@ def main() -> None:
     parser.add_argument("--wait", type=int, default=0, help="Extra wait time after page load (ms)")
     parser.add_argument("--zip", default="90035", help="Set delivery zip code (default: 90035)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    parser.add_argument("-s", "--search", action="store_true", help="Treat URL as a search term instead of product URL")
+    parser.add_argument("-n", "--max-results", type=int, default=5, help="Maximum number of search results to scrape (default: 5)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -93,6 +96,7 @@ def main() -> None:
 
     page = None
     product = None
+    results = []
 
     try:
         session.start()
@@ -101,73 +105,163 @@ def main() -> None:
         if clean_url != args.url and args.verbose:
             log.info("Cleaned URL: %s", clean_url)
 
-        for attempt in range(args.retries):
-            if page:
-                page.close()
-
-            page = session.navigate_with_retry(
-                clean_url,
-                retries=args.retries,
+        if args.search:
+            # Search mode
+            results = search_amazon(
+                session=session,
+                query=args.url,
+                max_results=args.max_results,
                 timeout=args.timeout,
                 wait=args.wait,
                 verbose=args.verbose,
             )
 
-            session.set_zip_code(page, zip_code=args.zip, verbose=args.verbose)
-
-            page.wait_for_timeout(1500)
-
-            html = page.content()
-            product = parse_product(html, url=args.url)
-            product = enrich_from_browser(product, page)
-
-            if product.price and product.asin:
-                break
-
-            missing = []
-            if not product.price:
-                missing.append("price")
-            if not product.asin:
-                missing.append("asin")
             if args.verbose:
-                log.warning("Attempt %d/%d: missing %s, retrying...", attempt + 1, args.retries, ", ".join(missing))
+                log.info("Found %d search results", len(results))
 
-            if attempt < args.retries - 1:
-                time.sleep(2**attempt + random.uniform(0, 1))
-        else:
-            missing = []
-            if not product.price:
-                missing.append("price")
-            if not product.asin:
-                missing.append("asin")
-            raise ScrapeError(clean_url, f"missing {', '.join(missing)} after {args.retries} attempts", "parse")
+            # Process each result
+            all_products = []
+            for i, url in enumerate(results):
+                if args.verbose:
+                    log.info("Processing result %d/%d: %s", i + 1, len(results), url)
 
-        if args.verbose:
-            log.info("URL: %s", args.url)
-            log.info("Title: %s", product.title)
-            log.info("Price: %s", product.price)
-            log.info("Rating: %s", product.rating)
-            log.info("Reviews: %s", product.review_count)
+                try:
+                    for attempt in range(args.retries):
+                        if page:
+                            page.close()
 
-        output_dir = Path("output")
-        output_dir.mkdir(parents=True, exist_ok=True)
+                        page = session.navigate_with_retry(
+                            url,
+                            retries=args.retries,
+                            timeout=args.timeout,
+                            wait=args.wait,
+                            verbose=args.verbose,
+                        )
 
-        if args.output:
-            out_path = Path(args.output)
-        else:
-            asin = "product"
-            m = re.search(r"/dp/([A-Z0-9]{10})", args.url)
-            if m:
-                asin = m.group(1)
+                        session.set_zip_code(page, zip_code=args.zip, verbose=args.verbose)
+
+                        page.wait_for_timeout(1500)
+
+                        html = page.content()
+                        product = parse_product(html, url=url)
+                        product = enrich_from_browser(product, page)
+
+                        if product.price and product.asin:
+                            break
+
+                        missing = []
+                        if not product.price:
+                            missing.append("price")
+                        if not product.asin:
+                            missing.append("asin")
+                        if args.verbose and attempt < args.retries - 1:
+                            log.warning("Attempt %d/%d: missing %s, retrying...", attempt + 1, args.retries, ", ".join(missing))
+
+                        if attempt < args.retries - 1:
+                            time.sleep(2**attempt + random.uniform(0, 1))
+                    else:
+                        missing = []
+                        if not product.price:
+                            missing.append("price")
+                        if not product.asin:
+                            missing.append("asin")
+                        if args.verbose:
+                            log.warning("Skipping result due to missing %s", ", ".join(missing))
+                        continue
+
+                    if args.verbose:
+                        log.info("Result %d: %s - %s", i + 1, product.title or "No title", product.price or "No price")
+
+                    all_products.append(product)
+
+                except Exception as e:
+                    if args.verbose:
+                        log.warning("Error processing result %d: %s", i + 1, e)
+                    continue
+
+            # Output results
+            output_data = [p.to_dict() for p in all_products]
+            json_output = json.dumps(output_data, indent=2, ensure_ascii=False)
+
+            if args.output:
+                out_path = Path(args.output)
+                atomic_write(out_path, json_output)
             else:
-                m = re.search(r"/gp/product/([A-Z0-9]{10})", args.url)
+                print(json_output)
+
+        else:
+            # Product mode (original behavior)
+            for attempt in range(args.retries):
+                if page:
+                    page.close()
+
+                page = session.navigate_with_retry(
+                    clean_url,
+                    retries=args.retries,
+                    timeout=args.timeout,
+                    wait=args.wait,
+                    verbose=args.verbose,
+                )
+
+                session.set_zip_code(page, zip_code=args.zip, verbose=args.verbose)
+
+                page.wait_for_timeout(1500)
+
+                html = page.content()
+                product = parse_product(html, url=args.url)
+                product = enrich_from_browser(product, page)
+
+                if product.price and product.asin:
+                    break
+
+                missing = []
+                if not product.price:
+                    missing.append("price")
+                if not product.asin:
+                    missing.append("asin")
+                if args.verbose:
+                    log.warning("Attempt %d/%d: missing %s, retrying...", attempt + 1, args.retries, ", ".join(missing))
+
+                if attempt < args.retries - 1:
+                    time.sleep(2**attempt + random.uniform(0, 1))
+            else:
+                missing = []
+                if not product.price:
+                    missing.append("price")
+                if not product.asin:
+                    missing.append("asin")
+                raise ScrapeError(clean_url, f"missing {', '.join(missing)} after {args.retries} attempts", "parse")
+
+            if args.verbose:
+                log.info("URL: %s", args.url)
+                log.info("Title: %s", product.title)
+                log.info("Price: %s", product.price)
+                log.info("Rating: %s", product.rating)
+                log.info("Reviews: %s", product.review_count)
+                log.info("ASIN: %s", product.asin)
+                log.info("Availability: %s", product.availability)
+                log.info("Images: %d", len(product.images))
+                log.info("Bullet points: %d", len(product.bullets))
+
+            output_dir = Path("output")
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            if args.output:
+                out_path = Path(args.output)
+            else:
+                asin = "product"
+                m = re.search(r"/dp/([A-Z0-9]{10})", args.url)
                 if m:
                     asin = m.group(1)
-            out_path = output_dir / f"{asin}.json"
+                else:
+                    m = re.search(r"/gp/product/([A-Z0-9]{10})", args.url)
+                    if m:
+                        asin = m.group(1)
+                out_path = output_dir / f"{asin}.json"
 
-        json_output = product.to_json()
-        atomic_write(out_path, json_output)
-        print(json_output)
+            json_output = product.to_json()
+            atomic_write(out_path, json_output)
+            print(json_output)
 
     except ScrapeError as e:
         log.error("%s", e)
