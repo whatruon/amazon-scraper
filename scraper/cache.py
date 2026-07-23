@@ -1,0 +1,206 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import tempfile
+import time
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Optional
+
+log = logging.getLogger(__name__)
+
+CACHE_VERSION = "1"
+
+
+@dataclass
+class CacheEntry:
+    url: str
+    cached_at: float  # Unix timestamp
+    ttl_seconds: int
+    version: str = CACHE_VERSION
+
+
+class HtmlCache:
+    """Disk-based cache for HTML responses, keyed by URL hash.
+
+    Each cached URL stores two files under *cache_dir*:
+        <key>.html      — the raw HTML content
+        <key>.meta.json — JSON-serialized CacheEntry metadata
+
+    Cache entries are invalidated by TTL.  A get() for an expired entry
+    returns None and cleans up the stale files automatically.
+    """
+
+    def __init__(
+        self,
+        cache_dir: str | Path = "cache",
+        ttl_seconds: int = 3600,
+    ) -> None:
+        self._dir = Path(cache_dir)
+        self._ttl = ttl_seconds
+        self._hits = 0
+        self._misses = 0
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def get(self, url: str) -> Optional[str]:
+        """Return cached HTML for *url*, or None if not cached / expired."""
+        key = self._key(url)
+        # Cleanup any orphaned temp files from previous crashes
+        for p in self._dir.glob(f"{key}*.tmp"):
+            p.unlink(missing_ok=True)
+        html_path = self._html_path(key)
+        meta_path = self._meta_path(key)
+
+        if not html_path.exists():
+            # Orphaned meta — clean up
+            self._remove(key)
+            self._misses += 1
+            return None
+        if not meta_path.exists():
+            self._misses += 1
+            return None
+
+        entry = self._read_meta(meta_path)
+        if entry is None:
+            # Corrupted meta — clean up stale files
+            self._remove(key)
+            self._misses += 1
+            return None
+
+        if entry.version != CACHE_VERSION:
+            self._remove(key)
+            self._misses += 1
+            return None
+
+        if self._is_expired(entry):
+            self._remove(key)
+            if log.isEnabledFor(logging.DEBUG):
+                log.debug("Cache expired for %s", url)
+            self._misses += 1
+            return None
+
+        html = self._read_html(html_path)
+        if html is None:
+            self._remove(key)
+            self._misses += 1
+            return None
+
+        self._hits += 1
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("Cache hit for %s (%d bytes)", url, len(html))
+        return html
+
+    def put(self, url: str, html: str) -> None:
+        """Store *html* for *url* in the cache."""
+        self._dir.mkdir(parents=True, exist_ok=True)
+        key = self._key(url)
+        entry = CacheEntry(
+            url=url,
+            cached_at=time.time(),
+            ttl_seconds=self._ttl,
+        )
+
+        # Write meta first so a crash after writing HTML but before meta
+        # is detectable (meta missing → entry treated as absent).
+        atomic_write(self._meta_path(key), json.dumps(asdict(entry)))
+        atomic_write(self._html_path(key), html)
+
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("Cached %s (%d bytes)", url, len(html))
+
+    def invalidate(self, url: str) -> None:
+        """Remove the cache entry for *url*, if one exists."""
+        self._remove(self._key(url))
+
+    def clear(self) -> None:
+        """Remove all cache entries managed by this cache."""
+        if not self._dir.exists():
+            return
+        for path in list(self._dir.iterdir()):
+            if path.suffix == ".html" or path.name.endswith(".meta.json"):
+                path.unlink(missing_ok=True)
+
+    def stats(self) -> dict:
+        """Return summary statistics about the cache."""
+        total = 0
+        total_bytes = 0
+        expired = 0
+        if self._dir.exists():
+            for path in self._dir.iterdir():
+                if path.suffix != ".html":
+                    continue
+                total += 1
+                total_bytes += path.stat().st_size
+                meta_path = self._meta_path(path.stem)
+                entry = self._read_meta(meta_path)
+                if entry and self._is_expired(entry):
+                    expired += 1
+
+        return {
+            "total_entries": total,
+            "total_bytes": total_bytes,
+            "expired_entries": expired,
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": self._hits / (self._hits + self._misses)
+            if (self._hits + self._misses) > 0
+            else 0.0,
+            "cache_dir": str(self._dir),
+            "ttl_seconds": self._ttl,
+        }
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _key(url: str) -> str:
+        return hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+    def _html_path(self, key: str) -> Path:
+        return self._dir / f"{key}.html"
+
+    def _meta_path(self, key: str) -> Path:
+        return self._dir / f"{key}.meta.json"
+
+    def _is_expired(self, entry: CacheEntry) -> bool:
+        return (time.time() - entry.cached_at) > entry.ttl_seconds
+
+    def _remove(self, key: str) -> None:
+        self._html_path(key).unlink(missing_ok=True)
+        self._meta_path(key).unlink(missing_ok=True)
+        # Cleanup any orphaned temp files
+        for p in self._dir.glob(f"{key}*.tmp"):
+            p.unlink(missing_ok=True)
+
+    @staticmethod
+    def _read_meta(path: Path) -> Optional[CacheEntry]:
+        try:
+            raw = path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            return CacheEntry(**data)
+        except (OSError, json.JSONDecodeError, TypeError, KeyError):
+            return None
+
+    @staticmethod
+    def _read_html(path: Path) -> Optional[str]:
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+
+def atomic_write(path: Path, content: str) -> None:
+    """Atomically write *content* to *path* via tempfile + rename."""
+    fd, tmp = tempfile.mkstemp(suffix=".tmp", dir=path.parent)
+    try:
+        os.write(fd, content.encode("utf-8"))
+    finally:
+        os.close(fd)
+    Path(tmp).rename(path)

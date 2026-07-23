@@ -11,46 +11,9 @@ from playwright.sync_api import Browser, BrowserContext, Page
 from cloakbrowser import launch, launch_persistent_context
 
 from .models import ScrapeError
+from .config import VIEWPORTS, TIMEZONE_LOCALE, DOMAIN_LOCALE
 
 log = logging.getLogger(__name__)
-
-
-VIEWPORTS = [
-    {"width": 1920, "height": 1080},
-    {"width": 1366, "height": 768},
-    {"width": 1536, "height": 864},
-    {"width": 1440, "height": 900},
-    {"width": 1280, "height": 800},
-]
-
-TIMEZONE_LOCALE = [
-    ("America/New_York", "en-US"),
-    ("America/Chicago", "en-US"),
-    ("America/Denver", "en-US"),
-    ("America/Los_Angeles", "en-US"),
-]
-
-DOMAIN_LOCALE: dict[str, tuple[str, str]] = {
-    "amazon.ae": ("Asia/Dubai", "en-US"),
-    "amazon.co.uk": ("Europe/London", "en-US"),
-    "amazon.de": ("Europe/Berlin", "en-US"),
-    "amazon.fr": ("Europe/Paris", "en-US"),
-    "amazon.it": ("Europe/Rome", "en-US"),
-    "amazon.es": ("Europe/Madrid", "en-US"),
-    "amazon.ca": ("America/Toronto", "en-US"),
-    "amazon.co.jp": ("Asia/Tokyo", "en-US"),
-    "amazon.in": ("Asia/Kolkata", "en-US"),
-    "amazon.com.au": ("Australia/Sydney", "en-US"),
-    "amazon.com.br": ("America/Sao_Paulo", "en-US"),
-    "amazon.com.mx": ("America/Mexico_City", "en-US"),
-    "amazon.nl": ("Europe/Amsterdam", "en-US"),
-    "amazon.se": ("Europe/Stockholm", "en-US"),
-    "amazon.pl": ("Europe/Warsaw", "en-US"),
-    "amazon.sg": ("Asia/Singapore", "en-US"),
-    "amazon.eg": ("Africa/Cairo", "en-US"),
-    "amazon.sa": ("Asia/Riyadh", "en-US"),
-    "amazon.tr": ("Europe/Istanbul", "en-US"),
-}
 
 
 class BrowserSession:
@@ -79,6 +42,7 @@ class BrowserSession:
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self._owns_browser = False
+        self._stopped = False
 
     def start(self) -> None:
         kwargs = {
@@ -116,7 +80,8 @@ class BrowserSession:
             kwargs["args"].append(f"--fingerprint={self.fingerprint}")
 
         if self.persistent_name:
-            profile_path = self.profile_dir / self.persistent_name
+            name = self.persistent_name.replace("/", "_").replace("\\", "_").replace("..", "_")
+            profile_path = self.profile_dir / name
             profile_path.mkdir(parents=True, exist_ok=True)
             self.context = launch_persistent_context(str(profile_path), **kwargs)
             self._owns_browser = False
@@ -128,10 +93,19 @@ class BrowserSession:
             )
             self._owns_browser = True
 
+    def _mask_proxy(self) -> str:
+        """Mask credentials in proxy URL."""
+        if not self.proxy:
+            return ""
+        return re.sub(r"//[^@]+@", "//***:***@", self.proxy)
+
     def stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
         if self.context and not self.persistent_name:
             self.context.close()
-        if self.browser and self._owns_browser:
+        if self.browser:
             self.browser.close()
 
     def new_page(self) -> Page:
@@ -161,7 +135,7 @@ class BrowserSession:
                     d = toaster.query_selector(".glow-toaster-button-dismiss")
                     if d:
                         d.click()
-                        page.wait_for_timeout(500)
+                        page.wait_for_selector(".glow-toaster", state="hidden", timeout=5000)
 
             if not page.query_selector("#GLUXZipUpdateInput"):
                 trigger = page.query_selector("#nav-global-location-popover-link")
@@ -186,7 +160,7 @@ class BrowserSession:
             zip_input.click()
             zip_input.fill("")
             zip_input.type(zip_code, delay=50)
-            page.wait_for_timeout(300)
+            page.wait_for_selector("#GLUXZipUpdateInput", state="attached")
 
             apply_btn = page.query_selector("#GLUXZipUpdate input[type='submit']")
             if not apply_btn:
@@ -196,7 +170,7 @@ class BrowserSession:
             else:
                 page.keyboard.press("Enter")
 
-            page.wait_for_timeout(2000)
+            page.wait_for_selector("#GLUXZipUpdate", state="detached", timeout=10000)
 
             error_el = page.query_selector("#GLUXZipError:not(.GLUX_Hidden)")
             if error_el and error_el.is_visible():
@@ -205,7 +179,7 @@ class BrowserSession:
                 page.keyboard.press("Escape")
                 return
 
-            page.wait_for_timeout(1000)
+            page.wait_for_selector(".a-popover-inner, #GLUXZipUpdate", state="detached", timeout=5000)
 
             done_btn = page.query_selector("button[name='glowDoneButton']")
             if done_btn:
@@ -217,14 +191,15 @@ class BrowserSession:
                 else:
                     page.keyboard.press("Escape")
 
-            page.wait_for_timeout(1500)
+            page.wait_for_selector(".a-popover, #GLUXZipUpdateInput", state="hidden", timeout=5000)
 
             if verbose:
                 log.info("Zip code set to %s", zip_code)
 
-        except Exception as e:
+        except Exception:
+            # This is a best-effort function to set zip code; broader exception handling is acceptable as certain page elements may be missing or different
             if verbose:
-                log.warning("Could not set zip code: %s", e)
+                log.warning("Could not set zip code")
 
     def navigate_with_retry(
         self,
@@ -242,6 +217,7 @@ class BrowserSession:
 
                 capthca_btn = page.query_selector("button[alt='Continue shopping']")
                 if capthca_btn:
+                    log.warning("CAPTCHA detected on page")
                     if verbose:
                         log.info("CAPTCHA detected, clicking through...")
                     capthca_btn.click()
@@ -250,9 +226,23 @@ class BrowserSession:
                             "#productTitle, #dp, #centerCol",
                             timeout=10000,
                         )
+                        if wait:
+                            page.wait_for_timeout(wait)
+                        return page
                     except Exception:
-                        pass
-                    return page
+                        if verbose:
+                            log.warning("CAPTCHA click did not resolve, re-navigating...")
+                        page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+                        try:
+                            page.wait_for_selector(
+                                "#productTitle, #dp, #centerCol",
+                                timeout=10000,
+                            )
+                        except Exception:
+                            log.warning("CAPTCHA re-navigation did not resolve to product content")
+                        if wait:
+                            page.wait_for_timeout(wait)
+                        return page
 
                 # Wait for core product content, not a flat timeout
                 try:
@@ -277,4 +267,7 @@ class BrowserSession:
                     delay = 2**attempt + random.uniform(0, 1)
                     time.sleep(delay)
 
-        raise ScrapeError(url, str(last_exc), "navigation") from last_exc
+        error_msg = str(last_exc)
+        if self.proxy:
+            error_msg = re.sub(r"//[^@]+@", "//***:***@", error_msg)
+        raise ScrapeError(url, error_msg, "navigation") from last_exc

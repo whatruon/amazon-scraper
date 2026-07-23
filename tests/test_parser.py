@@ -89,3 +89,28 @@ def test_bullet_dedup():
     assert len(product.bullets) == 2
     assert product.bullets[0] == "Feature One"
     assert product.bullets[1] == "Feature Two"
+
+
+# ------------------------------------------------------------------
+# Availability extraction edge cases
+# ------------------------------------------------------------------
+
+def test_availability_empty_span_returns_none():
+    """Empty <span> inside #availability should yield None, not ''."""
+    html = '<html><body><div id="availability"><span>  </span></div></body></html>'
+    product = parse_product(html)
+    assert product.availability is None
+
+
+def test_availability_no_element_returns_none():
+    """No availability elements at all should yield None."""
+    html = '<html><body><div>no availability here</div></body></html>'
+    product = parse_product(html)
+    assert product.availability is None
+
+
+def test_availability_delivery_block():
+    """Fallback to #deliveryBlockMessage when #availability lacks a span."""
+    html = '<html><body><div id="deliveryBlockMessage">FREE delivery Dec 24</div></body></html>'
+    product = parse_product(html)
+    assert product.availability == "FREE delivery Dec 24"
