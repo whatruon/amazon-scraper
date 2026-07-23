@@ -8,6 +8,8 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import Page
 
 from .models import Product
+from .parser import extract_price
+from .config import ORIGINAL_PRICE_SELECTORS, DEAL_SELECTORS, COUPON_SELECTORS
 
 log = logging.getLogger(__name__)
 
@@ -63,38 +65,28 @@ def track_price(page: Page) -> dict:
                 original_val = float(re.sub(r'[^\d.]', '', price_info['original_price']))
                 if original_val > current_val:
                     savings = original_val - current_val
-                    price_info['savings_amount'] = f"${savings:.2f}"
+                    currency_match = re.search(r'^([$£€¥₹])', price_info['current_price'])
+                    currency_sym = currency_match.group(1) if currency_match else '$'
+                    price_info['savings_amount'] = f"{currency_sym}{savings:.2f}"
                     price_info['discount_percentage'] = f"{int((savings / original_val) * 100)}%"
                     price_info['is_on_sale'] = True
             except ValueError:
                 pass
 
-    except Exception as e:
-        log.warning(f"Error tracking price: {e}")
+    except Exception:
+        pass
 
     return price_info
 
 
 def _extract_current_price(soup: BeautifulSoup, page) -> str | None:
     """Extract current price using existing parser logic."""
-    from .parser import extract_price
     return extract_price(soup, page)
 
 
 def _extract_original_price(soup: BeautifulSoup) -> str | None:
     """Extract original/list price if item is on sale."""
-    # Common selectors for original/was price
-    original_price_selectors = [
-        '#priceblock_dealprice',  # Lightning Deal price (sometimes shows as original)
-        '.a-text-price .a-offscreen',  # Strike-through price
-        '#listPrice .a-offscreen',
-        '#priceblock_ourprice .a-text-price .a-offscreen',
-        '.a-size-base.a-color-secondary .a-offscreen',  # List price
-        '[data-testid="odal-original-price"] .a-offscreen',
-        '.a-section.a-spacing.microverse .a-text-price span',
-    ]
-
-    for selector in original_price_selectors:
+    for selector in ORIGINAL_PRICE_SELECTORS:
         el = soup.select_one(selector)
         if el:
             text = el.get_text(strip=True)
@@ -120,21 +112,8 @@ def _extract_deal_info(soup: BeautifulSoup) -> dict:
         'is_on_sale': False
     }
 
-    # Deal/badge selectors
-    deal_selectors = [
-        '#dealBadge_feature_div',
-        '#dealBadge',
-        '.dealBadge',
-        '[data-hawkeye-key="mkcp.dealbadge"]',
-        '.dealLabel',
-        '.a-badge.aok-align-bottom',
-        '.a-row.a-spacing-mini .a-color-price',
-        '#saleBadge',
-        '.a-row.a-size-base.a-color-price'
-    ]
-
     deal_text = ""
-    for selector in deal_selectors:
+    for selector in DEAL_SELECTORS:
         el = soup.select_one(selector)
         if el:
             deal_text = el.get_text(strip=True)
@@ -155,15 +134,7 @@ def _extract_deal_info(soup: BeautifulSoup) -> dict:
         deal_info['deal_type'] = deal_text
         deal_info['is_on_sale'] = True
 
-    # Check for coupon/discount indicators
-    coupon_selectors = [
-        '.couponBadge',
-        '[data-hook="promo-price"]',
-        '.a-section.couponClippableBlock',
-        '.promoBadge'
-    ]
-
-    for selector in coupon_selectors:
+    for selector in COUPON_SELECTORS:
         if soup.select_one(selector):
             deal_info['is_on_sale'] = True
             if not deal_info['deal_type']:

@@ -1,3 +1,4 @@
+from .cache import HtmlCache
 from .models import Product, ScrapeError
 from .parser import enrich_from_browser, extract_price, parse_product, parse_search_results
 from .browser import BrowserSession
@@ -8,6 +9,7 @@ from .search import search_amazon
 
 __all__ = [
     "BrowserSession",
+    "HtmlCache",
     "Product",
     "ScrapeError",
     "enrich_from_browser",

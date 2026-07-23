@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup, Tag
 from playwright.sync_api import Page
 
 from .models import Product
+from .config import SEE_ALL_REVIEWS_SELECTORS, LOAD_MORE_REVIEWS_SELECTORS
 
 log = logging.getLogger(__name__)
 
@@ -31,15 +32,7 @@ def scrape_reviews(page: Page, max_reviews: int = 100) -> list[dict]:
     reviews = []
 
     try:
-        # Try to click "See all reviews" or similar to get to reviews page
-        see_all_selectors = [
-            '[data-hook="see-all-reviews-link-foot"]',
-            '#reviews-medley-footer a',
-            '[data-hook="see-all-reviews-link"]',
-            'a[data-hook="see-all-reviews-link-foot"]'
-        ]
-
-        for selector in see_all_selectors:
+        for selector in SEE_ALL_REVIEWS_SELECTORS:
             try:
                 element = page.query_selector(selector)
                 if element and element.is_visible():
@@ -50,7 +43,7 @@ def scrape_reviews(page: Page, max_reviews: int = 100) -> list[dict]:
                 continue
 
         # Load more reviews if needed
-        reviews_collected = 0
+        seen_reviews = set()
         while len(reviews) < max_reviews:
             # Get page content
             content = page.content()
@@ -58,25 +51,21 @@ def scrape_reviews(page: Page, max_reviews: int = 100) -> list[dict]:
 
             # Extract reviews from current page
             review_elements = soup.select('[data-hook="review"]')
-
             for element in review_elements:
                 if len(reviews) >= max_reviews:
                     break
 
                 review_data = _extract_review_from_element(element)
                 if review_data:
-                    reviews.append(review_data)
+                    dedup_key = (review_data.get('text', ''), review_data.get('date', ''))
+                    if dedup_key not in seen_reviews:
+                        seen_reviews.add(dedup_key)
+                        reviews.append(review_data)
 
             # Try to load more reviews if we need more
             if len(reviews) < max_reviews:
-                load_more_selectors = [
-                    '[data-hook="see-more-reviews-link"]',
-                    '.a-pagination .a-last:not(.a-disabled) a',
-                    '[data-hook="pagination-bar"] .a-last:not(.a-disabled) a'
-                ]
-
                 load_more_clicked = False
-                for selector in load_more_selectors:
+                for selector in LOAD_MORE_REVIEWS_SELECTORS:
                     try:
                         element = page.query_selector(selector)
                         if element and element.is_visible():
@@ -94,7 +83,7 @@ def scrape_reviews(page: Page, max_reviews: int = 100) -> list[dict]:
                 break
 
     except Exception as e:
-        log.warning(f"Error scraping reviews: {e}")
+        log.warning("Error scraping reviews: %s", e)
 
     return reviews[:max_reviews]
 
@@ -132,17 +121,21 @@ def _extract_review_from_element(element: Tag) -> dict | None:
         verified = bool(verified_el and 'Verified Purchase' in verified_el.get_text())
 
         # Extract helpful votes
+        NUMBER_WORDS = {
+            'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+            'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
+        }
         helpful_el = element.select_one('[data-hook="helpful-vote-statement"]')
         helpful_votes = None
         if helpful_el:
             helpful_text = helpful_el.get_text(strip=True)
-            # Extract number from text like "One person found this helpful" or "2 people found this helpful"
-            helpful_match = re.search(r'(\d+|One)\s*people?\s*found\s+this\s+helpful', helpful_text, re.IGNORECASE)
+            helpful_match = re.search(r'(\d+)\s*people?\s*found\s+this\s+helpful', helpful_text, re.IGNORECASE)
             if helpful_match:
-                count_str = helpful_match.group(1)
-                helpful_votes = 1 if count_str.lower() == 'one' else int(count_str)
-            elif 'One person' in helpful_text or 'One person found this helpful' in helpful_text:
-                helpful_votes = 1
+                helpful_votes = int(helpful_match.group(1))
+            else:
+                word_match = re.search(r'(One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten)\s*people?\s*found\s+this\s+helpful', helpful_text, re.IGNORECASE)
+                if word_match:
+                    helpful_votes = NUMBER_WORDS.get(word_match.group(1).lower(), 1)
 
         return {
             'text': text,
@@ -153,5 +146,5 @@ def _extract_review_from_element(element: Tag) -> dict | None:
         }
 
     except Exception as e:
-        log.warning(f"Failed to extract review from element: {e}")
+        log.warning("Failed to extract review from element: %s", e)
         return None

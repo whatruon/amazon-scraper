@@ -8,6 +8,14 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import Page
 
 from .models import Product
+from .config import (
+    SELLER_SELECTORS,
+    FBA_SELECTORS,
+    SELLER_RATING_SELECTORS,
+    SELLER_BUYBOX_SELECTORS,
+    SELLER_PROMINENT_SELECTORS,
+    SHIPS_FROM_SELECTORS,
+)
 
 log = logging.getLogger(__name__)
 
@@ -59,7 +67,7 @@ def scrape_seller_info(page: Page) -> dict:
             seller_info['seller_rating_count'] = rating_count
 
         # Check if seller owns the Buy Box
-        buybox_owner = _is_buybox_owner(soup)
+        buybox_owner = _is_buybox_owner(soup, seller_name=seller_name)
         seller_info['buybox_owner'] = buybox_owner
 
         # Extract ships from location
@@ -68,31 +76,19 @@ def scrape_seller_info(page: Page) -> dict:
             seller_info['ships_from'] = ships_from
 
     except Exception as e:
-        log.warning(f"Error scraping seller info: {e}")
+        log.warning("Error scraping seller info: %s", e)
 
     return seller_info
 
 
 def _extract_seller_name(soup: BeautifulSoup) -> str | None:
     """Extract seller/merchant name."""
-    # Common selectors for seller information
-    seller_selectors = [
-        '#bylineInfo',
-        '#bylineInfo_feature_div',
-        '#merchant-info',
-        '#merchantInfo',
-        '[data-feature-name="bylineInfo"]',
-        '#byline',
-        '#bylineInfo_text',
-        '.tabular-buybox-text:nth-child(2) span'
-    ]
-
-    for selector in seller_selectors:
+    for selector in SELLER_SELECTORS:
         el = soup.select_one(selector)
         if el:
             text = el.get_text(strip=True)
             # Clean up common prefixes
-            text = re.sub(r'^(?:Visit the|Visit the|Sold by:?\s*)', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'^(?:Visit the|Sold by:?\s*)', '', text, flags=re.IGNORECASE)
             text = text.strip()
             if text and text != "" and len(text) > 1:
                 # Avoid generic text like "See more"
@@ -116,15 +112,6 @@ def _extract_seller_name(soup: BeautifulSoup) -> str | None:
 
 def _is_fulfilled_by_amazon(soup: BeautifulSoup) -> bool:
     """Check if product is fulfilled by Amazon."""
-    fba_selectors = [
-        '#tabular-buybox[data-csa-c-content-id="btfbb"]',
-        '#tabular-buybox',
-        '#shippingMethod',
-        '#mir-layout-DELIVERY_BLOCK-slot-PRIMARY_DELIVERY_MESSAGE_LARGE',
-        '#deliveryBlockMessage',
-        '#usp fulfullment-message'
-    ]
-
     fba_keywords = [
         'fulfilled by amazon',
         'ships from amazon',
@@ -135,7 +122,7 @@ def _is_fulfilled_by_amazon(soup: BeautifulSoup) -> bool:
     ]
 
     # Check specific FBA elements
-    for selector in fba_selectors:
+    for selector in FBA_SELECTORS:
         el = soup.select_one(selector)
         if el:
             text = el.get_text(strip=True).lower()
@@ -157,19 +144,10 @@ def _is_fulfilled_by_amazon(soup: BeautifulSoup) -> bool:
 
 def _extract_seller_rating(soup: BeautifulSoup) -> tuple[str | None, str | None]:
     """Extract seller rating and rating count."""
-    # Seller rating selectors
-    rating_selectors = [
-        '#sellerProfileTriggerId',
-        '#merchant-vars:not(:empty)',
-        '[data-hook="avg-star-rating"]',
-        '#avgRating',
-        '.reviewCountTextLinkedHistogram'
-    ]
-
     rating_text = None
     rating_count = None
 
-    for selector in rating_selectors:
+    for selector in SELLER_RATING_SELECTORS:
         el = soup.select_one(selector)
         if el:
             text = el.get_text(strip=True)
@@ -182,7 +160,7 @@ def _extract_seller_rating(soup: BeautifulSoup) -> tuple[str | None, str | None]
                 count_match = re.search(r'([\d,]+)\s*(?:ratings?|reviews?)', text, re.I)
                 if count_match:
                     rating_count = count_match.group(1).replace(',', '')
-                if rating_text or rating_count:
+                if rating_text and rating_count:
                     break
 
     # Alternative: look for seller stars in feedback section
@@ -199,18 +177,8 @@ def _extract_seller_rating(soup: BeautifulSoup) -> tuple[str | None, str | None]
     return rating_text, rating_count
 
 
-def _is_buybox_owner(soup: BeautifulSoup) -> bool:
+def _is_buybox_owner(soup: BeautifulSoup, seller_name: str | None = None) -> bool:
     """Check if the seller owns the Buy Box."""
-    # The seller in the Buy Box is typically the first/seller featured in:
-    buybox_selectors = [
-        '#buybox-see-all-buying-choices',
-        '#buybox',
-        '#BuyBox',
-        '#mbc',
-        '#merchant-info',
-        '#merchantDetails'
-    ]
-
     # Look for "Sold by" near the price/add to cart area
     price_area = soup.select_one('#corePrice_feature_div, #corePriceDisplay_desktop_feature_div, #buybox')
     if price_area:
@@ -226,15 +194,15 @@ def _is_buybox_owner(soup: BeautifulSoup) -> bool:
         parent = button.find_parent()
         if parent:
             seller_text = parent.get_text()
-            if 'sold by' in seller_text.lower() or 'fulfilled by' in seller_text.lower():
+            if re.search(r'\bsold\s+by\b', seller_text, re.IGNORECASE) or \
+               re.search(r'\bfulfilled\s+by\b', seller_text, re.IGNORECASE):
                 return True
 
     # Default assumption: if we found a seller name and it's prominent, assume Buy Box owner
-    seller_name = _extract_seller_name(soup)
+    seller_name = seller_name or _extract_seller_name(soup)
     if seller_name:
         # Check if it's in prominent locations
-        prominent_selectors = ['#btfbb', '#merchant-info', '#merchantInfo', '#mir-layout-DELIVERY_BLOCK']
-        for selector in prominent_selectors:
+        for selector in SELLER_PROMINENT_SELECTORS:
             el = soup.select_one(selector)
             if el and seller_name.lower() in el.get_text().lower():
                 return True
@@ -244,16 +212,7 @@ def _is_buybox_owner(soup: BeautifulSoup) -> bool:
 
 def _extract_ships_from(soup: BeautifulSoup) -> str | None:
     """Extract where the item ships from."""
-    ships_from_selectors = [
-        '#shipsFrom',
-        '#shipsFromDetail',
-        '.tabular-buybox-text',
-        '#deliveryBlockMessage',
-        '#ubb-ufss-slot',
-        '#mir-layout-DELIVERY_BLOCK-slot-PRIMARY_DELIVERY_MESSAGE_LARGE'
-    ]
-
-    for selector in ships_from_selectors:
+    for selector in SHIPS_FROM_SELECTORS:
         el = soup.select_one(selector)
         if el:
             text = el.get_text(strip=True)

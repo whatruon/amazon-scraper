@@ -1,26 +1,23 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Optional
 
 from bs4 import BeautifulSoup, Tag
 
-from .models import Product
+from .models import Product, SearchResult
+from .config import (
+    PRICE_SELECTORS,
+    BRAND_SELECTORS,
+    PRODUCT_DETAILS_SELECTORS,
+    CATEGORY_SELECTORS,
+    VARIANT_SELECTORS,
+    MIN_IMAGE_SIZE,
+)
 
 log = logging.getLogger(__name__)
-
-PRICE_SELECTORS = [
-    "#corePrice_feature_div .a-offscreen",
-    "#corePrice_desktop .a-offscreen",
-    "#unifiedPrice_feature_div .a-offscreen",
-    "#corePriceDisplay_desktop_feature_div .aok-offscreen",
-    "#corePriceDisplay_desktop_feature_div .a-offscreen",
-    "#apex-pricetopay-accessibility-label",
-    "#priceblock_ourprice",
-    "#priceblock_dealprice",
-    "#price_inside_buybox",
-]
 
 
 def _extract_price_from_soup(soup: BeautifulSoup) -> Optional[str]:
@@ -42,26 +39,20 @@ def _extract_price_from_soup(soup: BeautifulSoup) -> Optional[str]:
 
 
 def _extract_price_from_browser(page) -> Optional[str]:
-    js = """
-    () => {
-        const containers = [
-            '#corePrice_feature_div',
-            '#corePrice_desktop',
-            '#unifiedPrice_feature_div',
-            '#corePriceDisplay_desktop_feature_div',
-            '#price_inside_buybox',
-            '#priceblock_ourprice',
-            '#priceblock_dealprice',
-        ];
-        for (const sel of containers) {
+    """Extract price via browser JS evaluation. Uses the same selectors as _extract_price_from_soup."""
+    selectors_json = json.dumps(PRICE_SELECTORS)
+    js = f"""
+    () => {{
+        const containers = {selectors_json};
+        for (const sel of containers) {{
             const el = document.querySelector(sel);
             if (!el) continue;
             const txt = el.innerText.trim();
-            const m = txt.match(/\\$\\d+(?:,\\d{3})*(?:\\.\\d{2})?/);
+            const m = txt.match(/[$£€¥₹]\\d+(?:,\\d{3})*(?:\\.\\d{{2}})?/);
             if (m) return m[0];
-        }
+        }}
         return null;
-    }
+    }}
     """
     return page.evaluate(js)
 
@@ -110,9 +101,6 @@ def _extract_review_count(soup: BeautifulSoup) -> Optional[str]:
     return None
 
 
-MIN_IMAGE_SIZE = 200
-
-
 def _is_large_image(url: str) -> bool:
     m = re.search(r"_(?:SX|SY|SL|SS|US|SR)(\d+)_", url)
     if m:
@@ -130,7 +118,7 @@ def _extract_images(soup: BeautifulSoup) -> list[str]:
             val = img.get(attr)
             if val and val not in seen and _is_large_image(val):
                 # Parse out the base image path to normalize size variants
-                base = re.sub(r"\._(AC|SX|SY|SL|SS|US|SR|FM|UX|V1|BG|PK)[^.]*_\.", ".", val)
+                base = re.sub(r"\._(AC|SX|SY|SL|SS|US|SR|FM|UX|V1|BG|PK)[^.]*?_\.", ".", val)
                 if base not in seen:
                     seen.add(base)
                     seen.add(val)
@@ -185,17 +173,17 @@ def _extract_availability(soup: BeautifulSoup) -> Optional[str]:
 
 
 def _extract_asin(soup: BeautifulSoup, url: str) -> Optional[str]:
-    m = re.search(r"/(?:dp|gp/product|product)/([A-Z0-9]{10})", url)
+    m = re.search(r"/(?:dp|gp/product|product)/([A-Za-z0-9]{10})", url)
     if m:
-        return m.group(1)
+        return m.group(1).upper()
     for meta in soup.select("meta[name='asin']"):
         asin = meta.get("content")
-        if asin and re.match(r"^[A-Z0-9]{10}$", asin):
+        if asin and re.match(r"^[A-Za-z0-9]{10}$", asin):
             return asin
     input_el = soup.select_one("input[name='ASIN']")
     if input_el:
         asin = input_el.get("value")
-        if asin and re.match(r"^[A-Z0-9]{10}$", asin):
+        if asin and re.match(r"^[A-Za-z0-9]{10}$", asin):
             return asin
     return None
 
@@ -211,7 +199,11 @@ def _extract_brand(soup: BeautifulSoup) -> Optional[str]:
     # Try brand link
     el = soup.select_one("#bylineInfo")
     if el:
-        return el.get_text(strip=True)
+        text = el.get_text(strip=True)
+        # Clean up common patterns: "Visit the Sony Store" -> "Sony", "Brand: Sony" -> "Sony"
+        text = re.sub(r'^(?:Visit\s+the\s+|Brand:\s*)', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s+(?:Store|Brand|Shop)$', '', text, flags=re.IGNORECASE)
+        return text.strip()
     el = soup.select_one("a.brand-link, a[href*='/stores/brand/'], #po-brand .a-span2")
     if el:
         return el.get_text(strip=True)
@@ -225,37 +217,99 @@ def _extract_brand(soup: BeautifulSoup) -> Optional[str]:
     return None
 
 
-def parse_search_results(html: str) -> list[str]:
-    """Parse Amazon search results page and return a list of product URLs."""
+def parse_search_card(html: str, domain: str = "www.amazon.com") -> list[SearchResult]:
+    """Parse Amazon search results page and return structured SearchResult objects."""
     soup = BeautifulSoup(html, "lxml")
-    urls: list[str] = []
+    results: list[SearchResult] = []
+    seen_urls: set[str] = set()
 
     for card in soup.select('[data-component-type="s-search-result"]'):
         link = card.select_one("h2 a.a-link-normal, h2 a.a-text-normal")
         if not link:
             link = card.select_one("a.a-link-normal.s-link-style")
-        if link:
-            href = link.get("href", "")
-            if href and "/dp/" in href:
-                # Strip tracking query parameters
-                clean = re.sub(r"\?.*$", "", href)
-                if clean.startswith("/"):
-                    clean = "https://www.amazon.com" + clean
-                elif not clean.startswith("http"):
-                    clean = "https://www.amazon.com/" + clean.lstrip("/")
-                if clean not in urls:
-                    urls.append(clean)
+        if not link:
+            continue
 
-    # Also extract from pagination links if present
-    for a in soup.select("a.s-pagination-item"):
-        href = a.get("href", "")
-        if href and "/s?" in href:
-            if not href.startswith("http"):
-                href = "https://www.amazon.com" + href
-            # We don't add pagination URLs to the result list;
-            # the caller can use these to fetch more result pages.
+        href = link.get("href", "")
+        if not href or not ("/dp/" in href or "/gp/product/" in href or "/product/" in href):
+            continue
 
-    return urls
+        # Strip tracking query parameters
+        clean = re.sub(r"\?.*$", "", href)
+        if clean.startswith("/"):
+            clean = f"https://{domain}" + clean
+        elif not clean.startswith("http"):
+            clean = f"https://{domain}/" + clean.lstrip("/")
+
+        if clean in seen_urls:
+            continue
+        seen_urls.add(clean)
+
+        # Extract ASIN from URL
+        m = re.search(r"/(?:dp|gp/product|product)/([A-Za-z0-9]{10})", clean)
+        asin = m.group(1).upper() if m else None
+
+        # Extract title
+        title = link.get("title")
+        if not title:
+            title = link.get_text(strip=True)
+
+        # Extract price
+        price = None
+        whole_el = card.select_one(".a-price .a-price-whole")
+        if whole_el:
+            price_text = whole_el.get_text(strip=True)
+            fraction_el = card.select_one(".a-price .a-price-fraction")
+            if fraction_el:
+                frac = fraction_el.get_text(strip=True)
+                if frac:
+                    price_text += "." + frac
+            symbol_el = card.select_one(".a-price-symbol")
+            symbol = symbol_el.get_text(strip=True) if symbol_el else "$"
+            price = symbol + price_text
+
+        # Extract rating
+        rating = None
+        rating_el = card.select_one("i.a-icon-star, i.a-icon-star-small, span.a-icon-alt")
+        if rating_el:
+            rating_text = rating_el.get_text(strip=True)
+            rm = re.search(r"[\d.]+ out of 5", rating_text)
+            if rm:
+                rating = rm.group()
+
+        # Extract review count
+        review_count = None
+        review_el = card.select_one("span.a-size-base.s-underline-text")
+        if not review_el:
+            review_el = card.select_one("a.a-size-base[href*='customer-reviews']")
+        if not review_el:
+            review_el = card.select_one("span.a-size-base[aria-label*='ratings']")
+        if review_el:
+            text = review_el.get_text(strip=True).replace(",", "")
+            if text.isdigit():
+                review_count = text
+
+        # Check for Prime
+        is_prime = bool(card.select_one("i.a-icon-prime, i.a-icon-prime-small"))
+
+        results.append(
+            SearchResult(
+                url=clean,
+                asin=asin,
+                title=title,
+                price=price,
+                rating=rating,
+                review_count=review_count,
+                is_prime=is_prime,
+            )
+        )
+
+    return results
+
+
+def parse_search_results(html: str, domain: str = "www.amazon.com") -> list[str]:
+    """Compat wrapper — returns only URLs. Prefer parse_search_card for structured data."""
+    return [r.url for r in parse_search_card(html, domain)]
 
 
 def parse_product(html: str, url: str = "") -> Product:
@@ -274,6 +328,7 @@ def parse_product(html: str, url: str = "") -> Product:
 
 
 def enrich_from_browser(product: Product, page) -> Product:
+    """Fill missing product.price via browser JS evaluation. MUTATES the product in-place."""
     if not product.price:
         browser_price = _extract_price_from_browser(page)
         if browser_price:
