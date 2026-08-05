@@ -1,23 +1,25 @@
-from .cache import HtmlCache
-from .models import Product, ScrapeError
-from .parser import enrich_from_browser, extract_price, parse_product, parse_search_results
 from .browser import BrowserSession
-from .review import scrape_reviews
+from .cache import HtmlCache
+from .errors import ParseError, ScrapeError
+from .models import Product
+from .parser import enrich_from_browser, extract_price, parse_product, parse_search_results
 from .price_tracker import track_price
-from .seller import scrape_seller_info
+from .review import scrape_reviews
 from .search import search_amazon
+from .seller import scrape_seller_info
 
 __all__ = [
     "BrowserSession",
     "HtmlCache",
+    "ParseError",
     "Product",
     "ScrapeError",
     "enrich_from_browser",
     "extract_price",
     "parse_product",
     "parse_search_results",
-    "search_amazon",
     "scrape_reviews",
-    "track_price",
     "scrape_seller_info",
+    "search_amazon",
+    "track_price",
 ]

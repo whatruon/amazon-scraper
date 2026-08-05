@@ -1,0 +1,11 @@
+{
+  "$schema": "https://apify.com/schemas/v1/actor.ide.json",
+  "actorSpecification": 1,
+  "name": "amazon-scraper",
+  "title": "Amazon Product Scraper",
+  "description": "Scrapes Amazon product details, search results, prices, ratings and sellers using a stealth Chromium browser and the Apify proxy.",
+  "version": "1.0.0",
+  "buildTag": "latest",
+  "dockerfile": "../Dockerfile",
+  "input": "./INPUT_SCHEMA.json"
+}

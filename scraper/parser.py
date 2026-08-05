@@ -3,101 +3,165 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Optional
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 
-from .models import Product, SearchResult
 from .config import (
-    PRICE_SELECTORS,
+    AVAILABILITY_SELECTORS,
     BRAND_SELECTORS,
-    PRODUCT_DETAILS_SELECTORS,
-    CATEGORY_SELECTORS,
-    VARIANT_SELECTORS,
+    IMAGE_CONTAINER_SELECTORS,
+    IMAGE_SELECTORS,
     MIN_IMAGE_SIZE,
+    PRICE_SELECTORS,
+    PRODUCT_DETAILS_SELECTORS,
+    RATING_SELECTORS,
+    REVIEW_COUNT_SELECTORS,
+    SEARCH_RESULT_SELECTORS,
+    SEARCH_TITLE_SELECTORS,
+    TITLE_SELECTORS,
 )
+from .models import Product, SearchResult
 
 log = logging.getLogger(__name__)
 
+# Character class of the currency symbols Amazon uses. Escaped to be safe inside
+# a JS regex literal (the class may not be representable without escaping).
+_CURRENCY_CLASS = r"[$£€¥₹]"
 
-def _extract_price_from_soup(soup: BeautifulSoup) -> Optional[str]:
+# Common localized "X out of 5" rating phrases, so EU pages (amazon.de renders
+# "4,7 von 5 Sternen", amazon.fr "4,7 sur 5 étoiles", etc.) are normalized.
+_RATING_PHRASE = r"(\d+[\.,]?\d*)\s*(?:von|sur|de|su|av|aus|van|da|af|di|over|of|out\s*of)\s*5\b"
+
+
+def _normalize_rating(text: str) -> str | None:
+    """Normalize a localized rating text to 'X out of 5' with a dot decimal.
+
+    Accepts English ('4.7 out of 5'), German ('4,7 von 5 Sternen'), French
+    ('4,7 sur 5 étoiles'), bare numbers ('4.7'), and comma decimals ('4,7').
+    Returns None when no rating can be identified.
+    """
+    if not text:
+        return None
+    text = text.strip()
+    m = re.search(_RATING_PHRASE, text, re.IGNORECASE)
+    if m:
+        value = m.group(1).replace(",", ".")
+        try:
+            rating = float(value)
+        except ValueError:
+            return None
+        if not 0.0 <= rating <= 5.0:
+            return None
+        # Normalize over-precise decimals (e.g. '4,70' -> '4.7') so the output
+        # still passes Product.validate_rating(), which accepts at most one
+        # decimal place.
+        if "." in value and len(value.rsplit(".", 1)[1]) > 1:
+            value = f"{rating:.1f}"
+        return f"{value} out of 5"
+    if re.fullmatch(r"\d+\.?\d*", text):
+        return text
+    return None
+
+
+def _extract_price_from_soup(soup: BeautifulSoup) -> str | None:
+    """Extract a price from HTML using the standardized PRICE_SELECTORS list.
+
+    Falls back to the generic Amazon price component, skipping elements embedded
+    inside sponsored "CardInstance" containers.
+    """
     for sel in PRICE_SELECTORS:
         el = soup.select_one(sel)
         if el:
             text = el.get_text(strip=True)
-            if text:
+            # Require an actual currency symbol so selectors matching labels/empty
+            # wrappers are skipped.
+            if text and re.search(_CURRENCY_CLASS, text):
                 return text
 
     for price_tag in soup.select(".a-price:not(.a-text-price)"):
+        # Ignore prices rendered inside sponsored/related cards.
+        if price_tag.find_parent(lambda t: t.name == "div" and t.get("id", "").startswith("CardInstance")) is not None:
+            continue
         off = price_tag.select_one(".a-offscreen")
         if off:
             text = off.get_text(strip=True)
-            if text and not price_tag.find_parent(lambda t: t.name == "div" and t.get("id", "").startswith("CardInstance")):
+            if text:
                 return text
 
     return None
 
 
-def _extract_price_from_browser(page) -> Optional[str]:
-    """Extract price via browser JS evaluation. Uses the same selectors as _extract_price_from_soup."""
+def _extract_price_from_browser(page) -> str | None:
+    """Extract price via browser JS evaluation using the same selector list."""
     selectors_json = json.dumps(PRICE_SELECTORS)
+    # Two forms: prefix symbol (US 'US$ 1,299.99') and trailing symbol (EU '1.234,56 €').
+    prefix_re = rf"{_CURRENCY_CLASS}\s*\d+(?:,\d{{3}})*(?:\.\d{{1,2}})?"
+    suffix_re = rf"\d+(?:\.\d{{3}})*(?:,\d{{1,2}})?\s*{_CURRENCY_CLASS}"
     js = f"""
     () => {{
         const containers = {selectors_json};
+        const re = /(?:{prefix_re}|{suffix_re})/;
         for (const sel of containers) {{
             const el = document.querySelector(sel);
             if (!el) continue;
             const txt = el.innerText.trim();
-            const m = txt.match(/[$£€¥₹]\\d+(?:,\\d{3})*(?:\\.\\d{{2}})?/);
+            const m = txt.match(re);
             if (m) return m[0];
         }}
         return null;
     }}
     """
-    return page.evaluate(js)
+    try:
+        return page.evaluate(js)
+    except Exception as e:
+        log.warning("Browser price extraction failed: %s", e)
+        return None
 
 
-def extract_price(soup: BeautifulSoup, page=None) -> Optional[str]:
+# Re-usable entry point: prefers static HTML, falls back to browser JS evaluation.
+def extract_price(soup: BeautifulSoup, page=None) -> str | None:
+    """Extract a price. Uses *page* (browser) only when HTML yields none."""
     price = _extract_price_from_soup(soup)
     if price:
         return price
-    if page:
+    if page is not None:
         return _extract_price_from_browser(page)
     return None
 
 
-def _extract_title(soup: BeautifulSoup) -> Optional[str]:
-    el = soup.select_one("#productTitle")
-    if el:
-        return el.get_text(strip=True)
-    el = soup.select_one("title")
-    if el:
-        text = el.get_text(strip=True)
-        text = re.sub(r"\s*:\s*Amazon\..*", "", text, flags=re.IGNORECASE)
-        return text.strip()
+def _extract_title(soup: BeautifulSoup) -> str | None:
+    for sel in TITLE_SELECTORS:
+        el = soup.select_one(sel)
+        if el:
+            text = el.get_text(strip=True)
+            if sel == "title":
+                text = re.sub(r"\s*:\s*Amazon\..*", "", text, flags=re.IGNORECASE)
+            if text:
+                return text.strip()
     return None
 
 
-def _extract_rating(soup: BeautifulSoup) -> Optional[str]:
-    el = soup.select_one("span[data-hook='rating-out-of-text']")
-    if el:
-        return el.get_text(strip=True)
-    el = soup.select_one(".a-icon-alt")
-    if el:
-        text = el.get_text(strip=True)
-        m = re.search(r"[\d.]+ out of 5", text)
-        if m:
-            return m.group()
+def _extract_rating(soup: BeautifulSoup) -> str | None:
+    for sel in RATING_SELECTORS:
+        el = soup.select_one(sel)
+        if el:
+            normalized = _normalize_rating(el.get_text(strip=True))
+            if normalized:
+                return normalized
     return None
 
 
-def _extract_review_count(soup: BeautifulSoup) -> Optional[str]:
-    el = soup.select_one("span[data-hook='total-review-count']")
-    if el:
-        return el.get_text(strip=True)
-    el = soup.select_one("#acrCustomerReviewText")
-    if el:
-        return el.get_text(strip=True)
+def _extract_review_count(soup: BeautifulSoup) -> str | None:
+    for sel in REVIEW_COUNT_SELECTORS:
+        el = soup.select_one(sel)
+        if el:
+            text = el.get_text(strip=True)
+            if not text:
+                continue
+            # "19,665 global ratings" -> "19665"; "1 global rating" -> "1".
+            digits = re.sub(r"[^\d]", "", text)
+            if digits:
+                return digits
     return None
 
 
@@ -113,7 +177,7 @@ def _extract_images(soup: BeautifulSoup) -> list[str]:
     images: list[str] = []
 
     # Search across both main image area and thumbnail strip
-    for img in soup.select("#imgTagWrapperId img, #main-image-container img, #altImages img, .imgTagWrapper img, #landingImage, #main-image"):
+    for img in soup.select(", ".join(IMAGE_SELECTORS)):
         for attr in ("data-old-hires", "src"):
             val = img.get(attr)
             if val and val not in seen and _is_large_image(val):
@@ -125,15 +189,20 @@ def _extract_images(soup: BeautifulSoup) -> list[str]:
                     images.append(val)
 
     # Also try data-a-dynamic-image on the wrappers
-    for container in soup.select("#imgTagWrapperId, #main-image-container, #altImages"):
+    for container in soup.select(", ".join(IMAGE_CONTAINER_SELECTORS)):
         dyn = container.get("data-a-dynamic-image")
         if dyn:
             try:
-                import json
                 parsed = json.loads(dyn)
                 candidates = sorted(parsed.keys(), key=lambda u: parsed[u][0], reverse=True)
                 for url in candidates:
-                    if max(parsed[url]) > 500 and url not in seen:
+                    if max(parsed[url]) > 500:
+                        # Same base image under a different size marker is a
+                        # duplicate of one already captured by the <img> loop.
+                        base = re.sub(r"\._(AC|SX|SY|SL|SS|US|SR|FM|UX|V1|BG|PK)[^.]*?_\.", ".", url)
+                        if base in seen or url in seen:
+                            continue
+                        seen.add(base)
                         seen.add(url)
                         images.append(url)
             except (json.JSONDecodeError, TypeError):
@@ -158,21 +227,17 @@ def _extract_bullets(soup: BeautifulSoup) -> list[str]:
     return bullets
 
 
-def _extract_availability(soup: BeautifulSoup) -> Optional[str]:
-    el = soup.select_one("#availability span")
-    if el:
-        text = el.get_text(strip=True)
-        if text:
-            return text
-    el = soup.select_one("#deliveryBlockMessage")
-    if el:
-        text = el.get_text(strip=True)
-        if text:
-            return text
+def _extract_availability(soup: BeautifulSoup) -> str | None:
+    for sel in AVAILABILITY_SELECTORS:
+        el = soup.select_one(sel)
+        if el:
+            text = el.get_text(strip=True)
+            if text:
+                return text
     return None
 
 
-def _extract_asin(soup: BeautifulSoup, url: str) -> Optional[str]:
+def _extract_asin(soup: BeautifulSoup, url: str) -> str | None:
     m = re.search(r"/(?:dp|gp/product|product)/([A-Za-z0-9]{10})", url)
     if m:
         return m.group(1).upper()
@@ -188,25 +253,31 @@ def _extract_asin(soup: BeautifulSoup, url: str) -> Optional[str]:
     return None
 
 
-def _extract_brand(soup: BeautifulSoup) -> Optional[str]:
+def _extract_brand(soup: BeautifulSoup) -> str | None:
     # Try product details table
-    for row in soup.select("#productDetails_detailBullets_sections1 tr, #prodDetails tr, #productDetails_techSpec_section_1 tr"):
+    for row in soup.select(", ".join(PRODUCT_DETAILS_SELECTORS)):
         th = row.select_one("th, .a-span3")
         if th and re.search(r"\bbrand\b", th.get_text(strip=True), re.IGNORECASE):
             td = row.select_one("td, .a-span9")
             if td:
                 return td.get_text(strip=True)
-    # Try brand link
-    el = soup.select_one("#bylineInfo")
-    if el:
-        text = el.get_text(strip=True)
-        # Clean up common patterns: "Visit the Sony Store" -> "Sony", "Brand: Sony" -> "Sony"
-        text = re.sub(r'^(?:Visit\s+the\s+|Brand:\s*)', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'\s+(?:Store|Brand|Shop)$', '', text, flags=re.IGNORECASE)
-        return text.strip()
-    el = soup.select_one("a.brand-link, a[href*='/stores/brand/'], #po-brand .a-span2")
-    if el:
-        return el.get_text(strip=True)
+    # Try brand link / byline
+    for sel in BRAND_SELECTORS:
+        el = soup.select_one(sel)
+        if not el:
+            continue
+        if sel.startswith(("#po-brand", "#bylineInfo")):
+            text = el.get_text(strip=True)
+            if sel == "#bylineInfo":
+                # Clean up common patterns: "Visit the Sony Store" -> "Sony", "Brand: Sony" -> "Sony"
+                text = re.sub(r'^(?:Visit\s+the\s+|Brand:\s*)', '', text, flags=re.IGNORECASE)
+                text = re.sub(r'\s+(?:Store|Brand|Shop)$', '', text, flags=re.IGNORECASE)
+            if text:
+                return text.strip()
+        else:
+            text = el.get_text(strip=True)
+            if text:
+                return text.strip()
     # Try brand from product overview
     for row in soup.select("#productOverview_feature_div tr, .po-brand"):
         th = row.select_one("td:first-child, .a-span3")
@@ -223,10 +294,12 @@ def parse_search_card(html: str, domain: str = "www.amazon.com") -> list[SearchR
     results: list[SearchResult] = []
     seen_urls: set[str] = set()
 
-    for card in soup.select('[data-component-type="s-search-result"]'):
-        link = card.select_one("h2 a.a-link-normal, h2 a.a-text-normal")
-        if not link:
-            link = card.select_one("a.a-link-normal.s-link-style")
+    for card in soup.select(", ".join(SEARCH_RESULT_SELECTORS)):
+        link = None
+        for sel in SEARCH_TITLE_SELECTORS:
+            link = card.select_one(sel)
+            if link:
+                break
         if not link:
             continue
 
@@ -236,6 +309,9 @@ def parse_search_card(html: str, domain: str = "www.amazon.com") -> list[SearchR
 
         # Strip tracking query parameters
         clean = re.sub(r"\?.*$", "", href)
+        # Also drop the /ref=... path segment; path refs are just as
+        # CAPTCHA-prone as query refs.
+        clean = re.sub(r"/ref=[^/]*/?$", "", clean)
         if clean.startswith("/"):
             clean = f"https://{domain}" + clean
         elif not clean.startswith("http"):
@@ -258,24 +334,43 @@ def parse_search_card(html: str, domain: str = "www.amazon.com") -> list[SearchR
         price = None
         whole_el = card.select_one(".a-price .a-price-whole")
         if whole_el:
-            price_text = whole_el.get_text(strip=True)
+            whole = whole_el.get_text(strip=True)
             fraction_el = card.select_one(".a-price .a-price-fraction")
-            if fraction_el:
-                frac = fraction_el.get_text(strip=True)
-                if frac:
-                    price_text += "." + frac
+            frac = fraction_el.get_text(strip=True) if fraction_el else ""
+
+            # Amazon renders the whole part with the market's thousands
+            # separator: '1,299' on US/UK pages, '1.234' on EU pages. The
+            # separator tells us which decimal separator to pair the fraction
+            # with so '1.234' + '56' becomes '1234,56', not '1.234.56'.
+            if "." in whole:
+                whole = whole.replace(".", "")
+                price_text = f"{whole},{frac}" if frac else whole
+            else:
+                price_text = f"{whole}.{frac}" if frac else whole
+
             symbol_el = card.select_one(".a-price-symbol")
-            symbol = symbol_el.get_text(strip=True) if symbol_el else "$"
+            symbol = symbol_el.get_text(strip=True) if symbol_el else ""
+            if not symbol:
+                price_el = card.select_one(".a-price")
+                if price_el:
+                    m = re.search(r"[$£€¥₹]", price_el.get_text())
+                    if m:
+                        symbol = m.group(0)
             price = symbol + price_text
 
-        # Extract rating
+        # Fallback: some layouts only render the offscreen price text.
+        if price is None:
+            off_el = card.select_one(".a-price .a-offscreen")
+            if off_el:
+                off_text = off_el.get_text(strip=True)
+                if off_text and re.search(r"[$£€¥₹]", off_text):
+                    price = off_text
+
+        # Extract rating (localized texts like "4,7 von 5 Sternen" are normalized)
         rating = None
         rating_el = card.select_one("i.a-icon-star, i.a-icon-star-small, span.a-icon-alt")
         if rating_el:
-            rating_text = rating_el.get_text(strip=True)
-            rm = re.search(r"[\d.]+ out of 5", rating_text)
-            if rm:
-                rating = rm.group()
+            rating = _normalize_rating(rating_el.get_text(strip=True))
 
         # Extract review count
         review_count = None
@@ -285,7 +380,8 @@ def parse_search_card(html: str, domain: str = "www.amazon.com") -> list[SearchR
         if not review_el:
             review_el = card.select_one("span.a-size-base[aria-label*='ratings']")
         if review_el:
-            text = review_el.get_text(strip=True).replace(",", "")
+            # Strip both comma (US '1,299') and dot (EU '1.234') thousands separators
+            text = review_el.get_text(strip=True).replace(",", "").replace(".", "")
             if text.isdigit():
                 review_count = text
 
@@ -315,6 +411,7 @@ def parse_search_results(html: str, domain: str = "www.amazon.com") -> list[str]
 def parse_product(html: str, url: str = "") -> Product:
     soup = BeautifulSoup(html, "lxml")
     return Product(
+        url=url,
         title=_extract_title(soup),
         price=_extract_price_from_soup(soup),
         rating=_extract_rating(soup),
@@ -328,7 +425,7 @@ def parse_product(html: str, url: str = "") -> Product:
 
 
 def enrich_from_browser(product: Product, page) -> Product:
-    """Fill missing product.price via browser JS evaluation. MUTATES the product in-place."""
+    """Fill missing product.price via browser JS evaluation. Mutates the product in-place."""
     if not product.price:
         browser_price = _extract_price_from_browser(page)
         if browser_price:

@@ -1,14 +1,14 @@
-"""Tests for the HtmlCache disk-based caching layer."""
+"""Tests for the HtmlCache disk-based caching layer."""  # noqa: INP001
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
 import pytest
 
-from scraper.cache import HtmlCache, CacheEntry
-
+from scraper.cache import ORPHAN_TMP_MAX_AGE, CacheEntry, HtmlCache
 
 # ------------------------------------------------------------------
 # Fixtures
@@ -386,6 +386,72 @@ def test_put_and_get_unicode(cache: HtmlCache):
     cache.put("https://amazon.co.jp/dp/B0TEST", html)
     result = cache.get("https://amazon.co.jp/dp/B0TEST")
     assert result == html
+
+
+# ------------------------------------------------------------------
+# cached_at metadata accessor
+# ------------------------------------------------------------------
+
+class TestCachedAt:
+
+    def test_returns_timestamp_for_cached(self, cache: HtmlCache):
+        cache.put("https://amazon.com/dp/B0OK", "<html>ok</html>")
+        ts = cache.cached_at("https://amazon.com/dp/B0OK")
+        assert isinstance(ts, float)
+        assert ts > 0
+
+    def test_uncached_returns_none(self, cache: HtmlCache):
+        assert cache.cached_at("https://amazon.com/dp/B0MISSING") is None
+
+    def test_corrupted_meta_returns_none(self, cache: HtmlCache):
+        cache.put("https://amazon.com/dp/B0OK", "<html>ok</html>")
+        key = cache._key("https://amazon.com/dp/B0OK")
+        cache._meta_path(key).write_text("not json", encoding="utf-8")
+        assert cache.cached_at("https://amazon.com/dp/B0OK") is None
+
+
+# ------------------------------------------------------------------
+# Orphaned temp file cleanup
+# ------------------------------------------------------------------
+
+class TestOrphanTempCleanup:
+
+    def test_orphaned_temp_cleaned_on_get(self, cache: HtmlCache):
+        """A leftover temp for the requested entry is removed on get."""
+        cache.put("https://amazon.com/dp/B0OK", "<html>ok</html>")
+        key = cache._key("https://amazon.com/dp/B0OK")
+        tmp = cache._dir / f".tmp-AAAAAAAA.{key}.html.tmp"
+        tmp.write_text("partial", encoding="utf-8")
+        old = time.time() - ORPHAN_TMP_MAX_AGE - 10
+        os.utime(tmp, (old, old))
+        cache.get("https://amazon.com/dp/B0OK")
+        assert not tmp.exists()
+
+    def test_stale_foreign_temp_swept(self, cache: HtmlCache):
+        """A stale temp with no matching entry is swept as a safety net."""
+        cache._dir.mkdir(parents=True, exist_ok=True)
+        tmp = cache._dir / ".tmp-FFFF.foreign.html.tmp"
+        tmp.write_text("partial", encoding="utf-8")
+        old = time.time() - ORPHAN_TMP_MAX_AGE - 10
+        os.utime(tmp, (old, old))
+        cache.get("https://amazon.com/dp/B0MISSING")
+        assert not tmp.exists()
+
+    def test_fresh_foreign_temp_preserved(self, cache: HtmlCache):
+        """A fresh temp (possible concurrent write) is left alone."""
+        cache._dir.mkdir(parents=True, exist_ok=True)
+        tmp = cache._dir / ".tmp-FFFF.foreign.html.tmp"
+        tmp.write_text("partial", encoding="utf-8")
+        cache.get("https://amazon.com/dp/B0MISSING")
+        assert tmp.exists()
+
+    def test_clear_removes_orphan_temps(self, cache: HtmlCache):
+        """clear() removes leftover temp files even when they are fresh."""
+        cache._dir.mkdir(parents=True, exist_ok=True)
+        tmp = cache._dir / ".tmp-FFFF.foreign.html.tmp"
+        tmp.write_text("partial", encoding="utf-8")
+        cache.clear()
+        assert not tmp.exists()
 
 
 # ------------------------------------------------------------------

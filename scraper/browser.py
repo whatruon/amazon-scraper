@@ -1,36 +1,60 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import random
 import re
 import time
 from pathlib import Path
-from typing import Optional
 
-from playwright.sync_api import Browser, BrowserContext, Page
 from cloakbrowser import launch, launch_persistent_context
+from playwright.sync_api import (
+    Browser,
+    BrowserContext,
+    Page,
+)
+from playwright.sync_api import (
+    TimeoutError as PlaywrightTimeoutError,
+)
 
-from .models import ScrapeError
-from .config import VIEWPORTS, TIMEZONE_LOCALE, DOMAIN_LOCALE
+from .config import DOMAIN_LOCALE, TIMEZONE_LOCALE, VIEWPORTS
+from .errors import BlockedError, CaptchaError, NavigationError, NavigationTimeout
+from .masking import mask_proxy_credentials
 
 log = logging.getLogger(__name__)
+
+
+def _page_looks_like_captcha(page: Page) -> bool:
+    """Best-effort detection of Amazon's CAPTCHA / robot-check page.
+
+    Returns True when the page carries any of the well-known CAPTCHA
+    indicators. Non-product pages without these indicators are not treated
+    as CAPTCHAs.
+    """
+    if page.query_selector("#captcha-form"):
+        return True
+    if page.query_selector("input[name='captcha']"):
+        return True
+    try:
+        title = page.title()
+    except Exception:
+        title = ""
+    return bool(title) and re.search(r"robot check|captcha", title, re.IGNORECASE) is not None
 
 
 class BrowserSession:
     def __init__(
         self,
         headless: bool = True,
-        humanize: bool = True,
-        proxy: Optional[str] = None,
+        proxy: str | None = None,
         geoip: bool = False,
-        fingerprint: Optional[str] = None,
-        user_agent: Optional[str] = None,
-        persistent: Optional[str] = None,
+        fingerprint: str | None = None,
+        user_agent: str | None = None,
+        persistent: str | None = None,
         profile_dir: Path = Path("profiles"),
         domain: str = "amazon.com",
     ):
         self.headless = headless
-        self.humanize = humanize
         self.proxy = proxy
         self.geoip = geoip
         self.fingerprint = fingerprint
@@ -39,35 +63,22 @@ class BrowserSession:
         self.profile_dir = profile_dir
         self.domain = domain
 
-        self.browser: Optional[Browser] = None
-        self.context: Optional[BrowserContext] = None
+        self.browser: Browser | None = None
+        self.context: BrowserContext | None = None
         self._owns_browser = False
         self._stopped = False
 
     def start(self) -> None:
         kwargs = {
             "headless": self.headless,
-            "humanize": self.humanize,
         }
-        if self.humanize:
-            kwargs["human_preset"] = "careful"
-            kwargs["human_config"] = {
-                "typing_delay": 200,
-                "typing_delay_spread": 100,
-                "mouse_steps_divisor": 4,
-                "mouse_max_steps": 120,
-                "mouse_wobble_max": 3.0,
-                "mouse_overshoot_chance": 0.2,
-                "idle_between_actions": True,
-                "idle_between_duration": (1.0, 2.5),
-            }
 
         dl = DOMAIN_LOCALE.get(self.domain)
         if dl:
             kwargs["timezone"] = dl[0]
             kwargs["locale"] = dl[1]
         else:
-            tz, locale = random.choice(TIMEZONE_LOCALE)
+            tz, locale = random.choice(TIMEZONE_LOCALE)  # noqa: S311
             kwargs["timezone"] = tz
             kwargs["locale"] = locale
 
@@ -75,6 +86,8 @@ class BrowserSession:
             kwargs["proxy"] = self.proxy
             if self.geoip:
                 kwargs["geoip"] = True
+        elif self.geoip:
+            log.warning("--geoip requires --proxy; timezone/locale will not be geo-detected")
         if self.fingerprint:
             kwargs.setdefault("args", [])
             kwargs["args"].append(f"--fingerprint={self.fingerprint}")
@@ -83,30 +96,28 @@ class BrowserSession:
             name = self.persistent_name.replace("/", "_").replace("\\", "_").replace("..", "_")
             profile_path = self.profile_dir / name
             profile_path.mkdir(parents=True, exist_ok=True)
+            kwargs["user_agent"] = self.user_agent
+            kwargs["viewport"] = random.choice(VIEWPORTS)  # noqa: S311
             self.context = launch_persistent_context(str(profile_path), **kwargs)
             self._owns_browser = False
         else:
             self.browser = launch(**kwargs)
             self.context = self.browser.new_context(
                 user_agent=self.user_agent,
-                viewport=random.choice(VIEWPORTS),
+                viewport=random.choice(VIEWPORTS),  # noqa: S311
             )
             self._owns_browser = True
-
-    def _mask_proxy(self) -> str:
-        """Mask credentials in proxy URL."""
-        if not self.proxy:
-            return ""
-        return re.sub(r"//[^@]+@", "//***:***@", self.proxy)
 
     def stop(self) -> None:
         if self._stopped:
             return
         self._stopped = True
-        if self.context and not self.persistent_name:
-            self.context.close()
+        if self.context:
+            with contextlib.suppress(Exception):
+                self.context.close()
         if self.browser:
-            self.browser.close()
+            with contextlib.suppress(Exception):
+                self.browser.close()
 
     def new_page(self) -> Page:
         return self.context.new_page()
@@ -197,7 +208,8 @@ class BrowserSession:
                 log.info("Zip code set to %s", zip_code)
 
         except Exception:
-            # This is a best-effort function to set zip code; broader exception handling is acceptable as certain page elements may be missing or different
+            # This is a best-effort function to set zip code; broader exception
+            # handling is acceptable as certain page elements may be missing.
             if verbose:
                 log.warning("Could not set zip code")
 
@@ -209,40 +221,46 @@ class BrowserSession:
         wait: int = 0,
         verbose: bool = False,
     ) -> Page:
-        last_exc: Optional[Exception] = None
+        last_exc: Exception | None = None
+        captcha_seen = False
         for attempt in range(retries):
-            page = self.new_page()
+            page = None
             try:
+                page = self.new_page()
                 page.goto(url, wait_until="domcontentloaded", timeout=timeout)
 
-                capthca_btn = page.query_selector("button[alt='Continue shopping']")
-                if capthca_btn:
+                captcha_btn = page.query_selector("button[alt='Continue shopping']")
+                if captcha_btn:
+                    captcha_seen = True
                     log.warning("CAPTCHA detected on page")
                     if verbose:
                         log.info("CAPTCHA detected, clicking through...")
-                    capthca_btn.click()
+                    captcha_btn.click()
                     try:
                         page.wait_for_selector(
                             "#productTitle, #dp, #centerCol",
                             timeout=10000,
                         )
-                        if wait:
-                            page.wait_for_timeout(wait)
-                        return page
                     except Exception:
                         if verbose:
                             log.warning("CAPTCHA click did not resolve, re-navigating...")
+                        # Reset page state instead of reusing the same (stale) instance
+                        page.close()
+                        page = self.new_page()
                         page.goto(url, wait_until="domcontentloaded", timeout=timeout)
                         try:
                             page.wait_for_selector(
                                 "#productTitle, #dp, #centerCol",
                                 timeout=10000,
                             )
-                        except Exception:
-                            log.warning("CAPTCHA re-navigation did not resolve to product content")
-                        if wait:
-                            page.wait_for_timeout(wait)
-                        return page
+                        except Exception as inner_e:
+                            masked = mask_proxy_credentials(str(inner_e))
+                            log.warning(
+                                "CAPTCHA re-navigation did not resolve to product content: %s",
+                                masked,
+                            )
+                            page.close()
+                            raise CaptchaError(url, masked) from inner_e
 
                 # Wait for core product content, not a flat timeout
                 try:
@@ -251,23 +269,49 @@ class BrowserSession:
                         timeout=5000,
                     )
                 except Exception:
-                    pass
+                    # A CAPTCHA page must never be returned as a successful
+                    # navigation; non-product pages without CAPTCHA indicators
+                    # are still allowed through.
+                    if _page_looks_like_captcha(page):
+                        captcha_seen = True
+                        reason = "CAPTCHA page served in place of product content"
+                        page.close()
+                        raise CaptchaError(url, reason) from None
 
+            except CaptchaError:
+                if page:
+                    page.close()
+                raise
+            except Exception as e:
+                last_exc = e
+                if page:
+                    page.close()
+                if verbose:
+                    log.warning(
+                        "Attempt %d/%d failed: %s",
+                        attempt + 1,
+                        retries,
+                        mask_proxy_credentials(str(e)),
+                    )
+                if attempt < retries - 1:
+                    delay = 2**attempt + random.uniform(0, 1)  # noqa: S311
+                    time.sleep(delay)
+            else:
                 if wait:
                     page.wait_for_timeout(wait)
 
                 return page
 
-            except Exception as e:
-                last_exc = e
-                page.close()
-                if verbose:
-                    log.warning("Attempt %d/%d failed: %s", attempt + 1, retries, e)
-                if attempt < retries - 1:
-                    delay = 2**attempt + random.uniform(0, 1)
-                    time.sleep(delay)
-
-        error_msg = str(last_exc)
-        if self.proxy:
-            error_msg = re.sub(r"//[^@]+@", "//***:***@", error_msg)
-        raise ScrapeError(url, error_msg, "navigation") from last_exc
+        # Centralized error masking and classification
+        error_msg = mask_proxy_credentials(str(last_exc))
+        if isinstance(last_exc, PlaywrightTimeoutError):
+            raise NavigationTimeout(url, error_msg) from last_exc
+        if captcha_seen:
+            raise CaptchaError(url, error_msg) from last_exc
+        if last_exc and re.search(
+            r"\b(?:503|509|403)\b|blocked|rate\s*limit|robot|bot\s*check",
+            error_msg,
+            re.IGNORECASE,
+        ):
+            raise BlockedError(url, error_msg) from last_exc
+        raise NavigationError(url, error_msg) from last_exc

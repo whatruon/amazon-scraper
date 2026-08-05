@@ -1,0 +1,134 @@
+{
+  "title": "Amazon Product Scraper",
+  "description": "Scrape Amazon product details from a search term or a list of product URLs. Results are pushed to the run's dataset as JSON records.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "searchTerm": {
+      "title": "Search term",
+      "type": "string",
+      "description": "Amazon search query. Each search result is opened and scraped individually. Leave empty to scrape URLs directly.",
+      "editor": "textfield",
+      "nullable": true,
+      "example": "sony wh-1000xm5"
+    },
+    "productUrls": {
+      "title": "Product URLs",
+      "type": "array",
+      "items": { "type": "string", "format": "url" },
+      "description": "List of Amazon product URLs to scrape (e.g. https://www.amazon.com/dp/B0ABC123XY). Ignored when a search term is provided.",
+      "nullable": true,
+      "example": ["https://www.amazon.com/dp/B0ABCDEF123"]
+    },
+    "domain": {
+      "title": "Amazon domain",
+      "type": "string",
+      "enum": [
+        "amazon.com", "amazon.ae", "amazon.co.uk", "amazon.de", "amazon.fr", "amazon.it",
+        "amazon.es", "amazon.ca", "amazon.co.jp", "amazon.in", "amazon.com.au",
+        "amazon.com.br", "amazon.com.mx", "amazon.nl", "amazon.se", "amazon.pl",
+        "amazon.sg", "amazon.eg", "amazon.sa", "amazon.tr"
+      ],
+      "description": "Marketplace to scrape. When product URLs are given, the domain is auto-detected from them.",
+      "default": "amazon.com",
+      "prefill": "amazon.com",
+      "editor": "select"
+    },
+    "maxResults": {
+      "title": "Maximum products",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 200,
+      "description": "Maximum number of search results to scrape.",
+      "default": 5,
+      "prefill": 5,
+      "unit": "products"
+    },
+    "maxPages": {
+      "title": "Maximum search pages",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 20,
+      "description": "Maximum number of search result pages to walk before collecting products.",
+      "default": 3,
+      "prefill": 3,
+      "unit": "pages"
+    },
+    "maxReviews": {
+      "title": "Maximum reviews per product",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 200,
+      "description": "Maximum number of customer reviews to scrape for each product. 0 disables review scraping.",
+      "default": 10,
+      "prefill": 10,
+      "unit": "reviews"
+    },
+    "zip": {
+      "title": "Delivery ZIP / postal code",
+      "type": "string",
+      "description": "Delivery location used for price and availability (only applied on amazon.com).",
+      "default": "90035",
+      "prefill": "90035"
+    },
+    "proxy": {
+      "title": "Proxy configuration",
+      "type": "object",
+      "description": "Apify proxy (recommended) or custom proxy URLs. Required for stable scraping at scale.",
+      "editor": "proxy",
+      "prefill": { "useApifyProxy": true }
+    },
+    "session": {
+      "title": "Proxy session ID",
+      "type": "string",
+      "description": "Optional sticky-IP session ID. When empty, the proxy rotates automatically. Use a fixed ID to keep one IP for the whole run.",
+      "editor": "textfield",
+      "nullable": true
+    },
+    "retries": {
+      "title": "Retries",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10,
+      "description": "Attempts per product before giving up.",
+      "default": 2,
+      "prefill": 2,
+      "unit": "attempts"
+    },
+    "timeout": {
+      "title": "Navigation timeout",
+      "type": "integer",
+      "minimum": 3000,
+      "maximum": 120000,
+      "description": "Timeout for a single page load.",
+      "default": 15000,
+      "prefill": 15000,
+      "unit": "milliseconds"
+    },
+    "wait": {
+      "title": "Wait after page load",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 30000,
+      "description": "Extra pause after each page loads, before extracting data.",
+      "default": 0,
+      "prefill": 0,
+      "unit": "milliseconds"
+    },
+    "verbose": {
+      "title": "Verbose logging",
+      "type": "boolean",
+      "description": "Enable detailed per-URL logging.",
+      "default": false,
+      "prefill": false
+    },
+    "freshRun": {
+      "title": "Ignore previous run state",
+      "type": "boolean",
+      "description": "Start from scratch instead of resuming URLs already scraped by an interrupted run.",
+      "default": false,
+      "prefill": false
+    }
+  },
+  "required": []
+}

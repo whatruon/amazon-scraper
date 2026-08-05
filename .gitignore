@@ -1,8 +1,15 @@
 .directory
+*.venv/
 .venv/
+.audit-venv/
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
 .env
 output/
 profiles/
+cache/
+.pytest_cache/
+.ruff_cache/
+storage/

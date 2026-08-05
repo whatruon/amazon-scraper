@@ -1,11 +1,8 @@
-"""
-Tests for search results parsing functionality.
-"""
+"""Tests for search results parsing functionality."""  # noqa: INP001
 from __future__ import annotations
 
-import pytest
-
-from scraper.parser import parse_search_results
+from scraper.models import Product
+from scraper.parser import parse_search_card, parse_search_results
 
 
 def test_parse_search_results_with_results():
@@ -108,8 +105,11 @@ def test_parse_search_results_from_fixture():
     <body>
         <div data-component-type="s-search-result">
             <h2 class="a-size-mini a-spacing-none a-color-base s-line-clamp-2">
-                <a class="a-link-normal s-underline-text s-underline-link-text s-link-style a-text-normal" href="/dp/B0074BW614?ref=sr_1_1&qid=1678886400&refinements=p_89%3ASony&rnid=2528832011&s=electronics&sr=1-1">
-                    <span class="a-size-medium a-color-base a-text-normal">Sony MDR7506 Professional Large Diaphragm Headphone</span>
+                <a class="a-link-normal s-underline-text s-underline-link-text s-link-style a-text-normal"
+                   href="/dp/B0074BW614?ref=sr_1_1&qid=1678886400&s=electronics&sr=1-1">
+                    <span class="a-size-medium a-color-base a-text-normal">
+                        Sony MDR7506 Professional Large Diaphragm Headphone
+                    </span>
                 </a>
             </h2>
             <div class="a-row a-size-small">
@@ -124,8 +124,11 @@ def test_parse_search_results_from_fixture():
         </div>
         <div data-component-type="s-search-result">
             <h2 class="a-size-mini a-spacing-none a-color-base s-line-clamp-2">
-                <a class="a-link-normal s-underline-text s-underline-link-text s-link-style a-text-normal" href="/dp/B0B9PXH6B2?ref=sr_1_2&qid=1678886400&refinements=p_89%3ASony&rnid=2528832011&s=electronics&sr=1-2">
-                    <span class="a-size-medium a-color-base a-text-normal">Sony WH-CH720N Noise Cancelling Wireless Headphones</span>
+                <a class="a-link-normal s-underline-text s-underline-link-text s-link-style a-text-normal"
+                   href="/dp/B0B9PXH6B2?ref=sr_1_2&qid=1678886400&s=electronics&sr=1-2">
+                    <span class="a-size-medium a-color-base a-text-normal">
+                        Sony WH-CH720N Noise Cancelling Wireless Headphones
+                    </span>
                 </a>
             </h2>
             <div class="a-row a-size-small">
@@ -162,3 +165,76 @@ def test_parse_search_results_from_fixture():
     assert len(urls) == 2
     assert "https://www.amazon.com/dp/B0074BW614" in urls
     assert "https://www.amazon.com/dp/B0B9PXH6B2" in urls
+
+
+def _card_html(price_markup: str, href: str = "/dp/B0XWXYZDE1") -> str:
+    return f"""
+    <html><body>
+        <div data-component-type="s-search-result">
+            <h2><a class="a-link-normal" href="{href}"><span>T</span></a></h2>
+            {price_markup}
+        </div>
+    </body></html>
+    """
+
+
+def test_parse_search_card_price_us_format():
+    """US markup: whole '1,299' + fraction '99' -> '1,299.99'."""
+    html = _card_html(
+        '<div class="a-price"><span class="a-price-symbol">$</span>'
+        '<span class="a-price-whole">1,299</span>'
+        '<span class="a-price-fraction">99</span></div>'
+    )
+    price = parse_search_card(html)[0].price
+    assert price == "$1,299.99"
+    assert Product(price=price).validate_price()
+
+
+def test_parse_search_card_price_eu_format():
+    """EU (amazon.de): whole '1.234' + fraction '56' must NOT yield '1.234.56'."""
+    html = _card_html(
+        '<div class="a-price"><span class="a-price-symbol">€</span>'
+        '<span class="a-price-whole">1.234</span>'
+        '<span class="a-price-fraction">56</span></div>'
+    )
+    result = parse_search_card(html, domain="amazon.de")[0]
+    assert result.price == "€1234,56"
+    assert Product(price=result.price).validate_price()
+
+
+def test_parse_search_card_price_eu_whole_number():
+    """EU price with no fraction (whole 1.234 with EU thousands)."""
+    html = _card_html(
+        '<div class="a-price"><span class="a-price-symbol">€</span>'
+        '<span class="a-price-whole">1.234</span></div>'
+    )
+    price = parse_search_card(html, domain="amazon.de")[0].price
+    assert price == "€1234"
+    assert Product(price=price).validate_price()
+
+
+def test_parse_search_card_strips_path_ref():
+    """Path refs (/dp/ASIN/ref=sr_1_1) must be stripped like query refs."""
+    html = _card_html("", href="/dp/B0XWXYZDE1/ref=sr_1_1?qid=1678886400&th=1")
+    result = parse_search_card(html)[0]
+    assert result.url == "https://www.amazon.com/dp/B0XWXYZDE1"
+    assert result.asin == "B0XWXYZDE1"
+
+
+def test_parse_search_card_price_from_offscreen_fallback():
+    """Cards that only render .a-offscreen must still yield a price."""
+    html = _card_html('<div class="a-price"><span class="a-offscreen">$148.00</span></div>')
+    price = parse_search_card(html)[0].price
+    assert price == "$148.00"
+    assert Product(price=price).validate_price()
+
+
+def test_parse_search_card_localized_rating_and_count():
+    """EU localized rating ('4,7 von 5 Sternen') and dot-thousands count normalize."""
+    html = _card_html(
+        '<span class="a-icon-alt">4,7 von 5 Sternen</span>'
+        '<span class="a-size-base s-underline-text">1.234</span>'
+    )
+    result = parse_search_card(html, domain="amazon.de")[0]
+    assert result.rating == "4.7 out of 5"
+    assert result.review_count == "1234"

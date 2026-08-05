@@ -1,11 +1,7 @@
-"""
-Tests for Product dataclass and its methods.
-"""
+"""Tests for Product dataclass and its methods."""  # noqa: INP001
 from __future__ import annotations
 
 import json
-
-import pytest
 
 from scraper.models import Product
 
@@ -62,6 +58,7 @@ def test_to_dict():
     )
 
     expected = {
+        "url": None,
         "title": "Test Product",
         "price": "$29.99",
         "rating": None,
@@ -72,10 +69,30 @@ def test_to_dict():
         "asin": "B0ABCDEF12",
         "brand": None,
         "schema_version": "1.0",
-        "scraped_at": None
+        "model_number": None,
+        "date_first_available": None,
+        "manufacturer": None,
+        "item_weight": None,
+        "dimensions": None,
+        "department": None,
+        "best_sellers_rank": None,
+        "category_path": None,
+        "variants": [],
+        "extraction_quality": {}
     }
 
-    assert product.to_dict() == expected
+    data = product.to_dict()
+    for key, value in expected.items():
+        assert data[key] == value
+    assert data["scraped_at"] is not None
+
+
+def test_to_dict_scraped_at_stable():
+    """Repeated to_dict() calls must produce the same scraped_at timestamp."""
+    product = Product(price="$29.99", asin="B0ABCDEF12")
+    first = product.to_dict()["scraped_at"]
+    second = product.to_dict()["scraped_at"]
+    assert first == second
 
 
 def test_to_json():
@@ -100,13 +117,18 @@ def test_to_json():
 
 
 def test_validate_asin_valid():
-    """Test ASIN validation with valid ASINs."""
+    """Test ASIN validation with valid ASINs.
+
+    ASINs are validated case-insensitively (10 alphanumeric chars).
+    """
     test_cases = [
         "B0ABCDEF12",
         "1234567890",
         "ABCDEF1234",
         "0123456789",
-        "A1B2C3D4E5"
+        "A1B2C3D4E5",
+        "b0abcdef12",   # lowercase accepted
+        "b0ABCDef12",   # mixed case accepted
     ]
 
     for asin in test_cases:
@@ -121,7 +143,6 @@ def test_validate_asin_invalid():
         "",
         "B0ABCDEF1",   # 9 chars
         "B0ABCDEF123", # 11 chars
-        "b0abcdef12",  # lowercase
         "B0ABCDEF!@",  # special chars
         "B0ABCD EF12", # space
         "B0ABCD.EF12", # dot
@@ -135,8 +156,8 @@ def test_validate_asin_invalid():
 def test_validate_price_valid():
     """Test price validation with valid price formats.
 
-    Note: Validates US-style price formatting (commas for thousands, dots for decimals).
-    European prices (e.g., €29,99) are not supported by this validator.
+    Supports US-style (dot decimal / comma thousands) and European-style
+    (comma decimal / dot thousands) formats, with leading or trailing symbols.
     """
     test_cases = [
         "$29.99",
@@ -147,7 +168,15 @@ def test_validate_price_valid():
         "$1,000,000.99",
         "£29.99",
         "¥2,999",
-        "₹2,999.00"
+        "₹2,999.00",
+        "€29.99",
+        "€29,99",       # European decimal comma
+        "R$1.234,56",   # Brazilian: dot thousands, comma decimal
+        "MX$2,999.99",  # Mexican: comma thousands, dot decimal
+        "29,99 €",      # trailing symbol
+        "$ 29.99",      # space after currency symbol (Amazon renders e.g. 'CDN$ 1,299.99')
+        "US$ 1,299.99", # multi-char symbol with space
+        "CDN$ 1,299.99",
     ]
 
     for price in test_cases:
@@ -160,14 +189,12 @@ def test_validate_price_invalid():
     test_cases = [
         None,
         "",
-        "29.99",       # No currency symbol
+        "29.99",        # No currency symbol
         "$",            # Only currency symbol
         "$abc",         # Non-numeric after currency
-        "$ 29.99",      # Space after currency symbol (not allowed)
         "free",         # Text
         "$29.999",      # Too many decimal places
         "$29,999,99",   # Invalid comma placement (not thousands grouping)
-        "€29,99",       # European format (decimal comma, not supported)
     ]
 
     for price in test_cases:

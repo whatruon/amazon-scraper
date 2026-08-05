@@ -5,21 +5,36 @@ build-backend = "setuptools.build_meta:__legacy__"
 [project]
 name = "amazon-scraper"
 description = "Amazon product scraper with anti-detection via CloakBrowser"
+readme = "README.md"
 requires-python = ">=3.11"
-dynamic = ["version"]
+version = "1.0.0"
 dependencies = [
     "playwright>=1.40",
-    "beautifulsoup4>=4.12",
+    "beautifulsoup4>=4.14",
     "lxml>=5.0",
-    "cloakbrowser>=0.4",
+    "cloakbrowser>=0.4.0",
+    "apify>=4.0",
+    "PyYAML>=6.0",
 ]
+
+[project.scripts]
+amazon-scraper = "cli:main"
+
+[tool.setuptools]
+packages = ["scraper", "src"]
+py-modules = ["cli"]
 
 [tool.ruff]
 target-version = "py311"
 line-length = 120
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W", "UP"]
+select = [
+    "E", "F", "I", "W", "UP",  # default pyflakes/pycodestyle/isort/pyupgrade
+    "A", "ASYNC", "B", "C4", "DTZ", "EM", "G", "ICN", "INP", "LOG",
+    "PERF", "PIE", "PT", "RET", "RUF", "S", "SIM", "T20", "TRY",
+]
+ignore = ["S101"]  # asserts in tests are intentional
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,6 +1,5 @@
 retries: 2
 timeout: 15000
 wait: 0
-humanize: true
 headless: true
 zip: "90035"

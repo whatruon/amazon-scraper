@@ -1,0 +1,31 @@
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Virtual environments
+.venv/
+.audit-venv/
+*.venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Runtime artifacts
+output/
+cache/
+profiles/
+storage/
+*.log
+
+# Environment / secrets
+.env
+
+# Editor
+.vscode/
+.idea/

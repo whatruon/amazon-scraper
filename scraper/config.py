@@ -1,21 +1,48 @@
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+
 # ------------------------------------------------------------------
 # Selectors — organized by extraction target
+#
+# Naming note: selectors target three distinct anchor types, reflecting
+# how Amazon exposes elements in the DOM:
+#   `#id`            - single HTML element by its `id` attribute
+#   `.class`         - element(s) matched by one or more CSS classes
+#   `[attr=...]`     - element matched by an attribute value
+# A single selector quite often combines two or more (e.g.
+# `#corePrice_feature_div .a-offscreen` finds the `.a-offscreen`
+# descendant of the `#corePrice_feature_div` id). `#` and `.` are not
+# interchangeable styles — they match different kinds of nodes — so the
+# lists keep whichever prefix(es) each selector actually needs.
 # ------------------------------------------------------------------
 
+# ------------------------------------------------------------------
+# Price — CURRENT selling price (the buybox / deal price you pay)
+# ------------------------------------------------------------------
 PRICE_SELECTORS = [
+    # Prime price display blocks
     "#corePrice_feature_div .a-offscreen",
     "#corePrice_desktop .a-offscreen",
     "#unifiedPrice_feature_div .a-offscreen",
     "#corePriceDisplay_desktop_feature_div .aok-offscreen",
     "#corePriceDisplay_desktop_feature_div .a-offscreen",
+    # Accessibility / legacy layout price nodes
     "#apex-pricetopay-accessibility-label",
     "#priceblock_ourprice",
     "#priceblock_dealprice",
     "#price_inside_buybox",
 ]
 
+# ------------------------------------------------------------------
+# Price — "original" price (strikethrough / list price, when the item
+# is on sale). Kept separate from PRICE_SELECTORS so a "current" price
+# is never masked by the "was" price; `#priceblock_dealprice` belongs
+# to the current-price group only.
+# ------------------------------------------------------------------
 ORIGINAL_PRICE_SELECTORS = [
     ".a-text-price .a-offscreen",
     "#listPrice .a-offscreen",
@@ -23,7 +50,6 @@ ORIGINAL_PRICE_SELECTORS = [
     ".a-size-base.a-color-secondary .a-offscreen",
     '[data-testid="odal-original-price"] .a-offscreen',
     ".a-section.a-spacing.microverse .a-text-price span",
-    "#priceblock_dealprice",
 ]
 
 TITLE_SELECTORS = ["#productTitle", "title"]
@@ -80,9 +106,6 @@ SELLER_SELECTORS = [
 FBA_SELECTORS = [
     "#tabular-buybox[data-csa-c-content-id='btfbb']",
     "#tabular-buybox",
-    "#shippingMethod",
-    "#mir-layout-DELIVERY_BLOCK-slot-PRIMARY_DELIVERY_MESSAGE_LARGE",
-    "#deliveryBlockMessage",
 ]
 
 SELLER_RATING_SELECTORS = [
@@ -91,22 +114,6 @@ SELLER_RATING_SELECTORS = [
     '[data-hook="avg-star-rating"]',
     "#avgRating",
     ".reviewCountTextLinkedHistogram",
-]
-
-SELLER_BUYBOX_SELECTORS = [
-    "#buybox-see-all-buying-choices",
-    "#buybox",
-    "#BuyBox",
-    "#mbc",
-    "#merchant-info",
-    "#merchantDetails",
-]
-
-SELLER_PROMINENT_SELECTORS = [
-    "#btfbb",
-    "#merchant-info",
-    "#merchantInfo",
-    "#mir-layout-DELIVERY_BLOCK",
 ]
 
 SHIPS_FROM_SELECTORS = [
@@ -122,22 +129,6 @@ PRODUCT_DETAILS_SELECTORS = [
     "#productDetails_detailBullets_sections1 tr",
     "#prodDetails tr",
     "#productDetails_techSpec_section_1 tr",
-]
-
-CATEGORY_SELECTORS = [
-    "#breadcrumb ul",
-    "#wayfinding-breadcrumbs_feature_div ul",
-    ".a-breadcrumb",
-]
-
-VARIANT_SELECTORS = [
-    "#variation_color_name li",
-    "#variation_size_name li",
-    "#variation_style_name li",
-    "#variation_length li",
-    ".twisterSwatch",
-    "li[data-asin]",
-    "li[data-defaultasin]",
 ]
 
 DEAL_SELECTORS = [
@@ -202,25 +193,25 @@ TIMEZONE_LOCALE = [
 ]
 
 DOMAIN_LOCALE: dict[str, tuple[str, str]] = {
-    "amazon.ae": ("Asia/Dubai", "en-US"),
-    "amazon.co.uk": ("Europe/London", "en-US"),
-    "amazon.de": ("Europe/Berlin", "en-US"),
-    "amazon.fr": ("Europe/Paris", "en-US"),
-    "amazon.it": ("Europe/Rome", "en-US"),
-    "amazon.es": ("Europe/Madrid", "en-US"),
-    "amazon.ca": ("America/Toronto", "en-US"),
-    "amazon.co.jp": ("Asia/Tokyo", "en-US"),
-    "amazon.in": ("Asia/Kolkata", "en-US"),
-    "amazon.com.au": ("Australia/Sydney", "en-US"),
-    "amazon.com.br": ("America/Sao_Paulo", "en-US"),
-    "amazon.com.mx": ("America/Mexico_City", "en-US"),
-    "amazon.nl": ("Europe/Amsterdam", "en-US"),
-    "amazon.se": ("Europe/Stockholm", "en-US"),
-    "amazon.pl": ("Europe/Warsaw", "en-US"),
-    "amazon.sg": ("Asia/Singapore", "en-US"),
-    "amazon.eg": ("Africa/Cairo", "en-US"),
-    "amazon.sa": ("Asia/Riyadh", "en-US"),
-    "amazon.tr": ("Europe/Istanbul", "en-US"),
+    "amazon.ae": ("Asia/Dubai", "en-AE"),
+    "amazon.co.uk": ("Europe/London", "en-GB"),
+    "amazon.de": ("Europe/Berlin", "de-DE"),
+    "amazon.fr": ("Europe/Paris", "fr-FR"),
+    "amazon.it": ("Europe/Rome", "it-IT"),
+    "amazon.es": ("Europe/Madrid", "es-ES"),
+    "amazon.ca": ("America/Toronto", "en-CA"),
+    "amazon.co.jp": ("Asia/Tokyo", "ja-JP"),
+    "amazon.in": ("Asia/Kolkata", "en-IN"),
+    "amazon.com.au": ("Australia/Sydney", "en-AU"),
+    "amazon.com.br": ("America/Sao_Paulo", "pt-BR"),
+    "amazon.com.mx": ("America/Mexico_City", "es-MX"),
+    "amazon.nl": ("Europe/Amsterdam", "nl-NL"),
+    "amazon.se": ("Europe/Stockholm", "sv-SE"),
+    "amazon.pl": ("Europe/Warsaw", "pl-PL"),
+    "amazon.sg": ("Asia/Singapore", "en-SG"),
+    "amazon.eg": ("Africa/Cairo", "en-EG"),
+    "amazon.sa": ("Asia/Riyadh", "en-SA"),
+    "amazon.tr": ("Europe/Istanbul", "tr-TR"),
 }
 
 # ------------------------------------------------------------------
@@ -242,8 +233,41 @@ DEFAULT_TIMEOUT = 15000        # Navigation timeout (ms)
 DEFAULT_RETRIES = 2            # Max retries on failure
 DEFAULT_MAX_RESULTS = 5        # Max search results
 DEFAULT_MAX_PAGES = 3          # Max search result pages
-DEFAULT_WAIT = 1500            # Extra wait after page load (ms)
+DEFAULT_MAX_REVIEWS = 10       # Max reviews scraped per product
 DEFAULT_ZIP_CODE = "90035"
 DEFAULT_CACHE_TTL = 3600       # Cache entry TTL (seconds)
 MIN_IMAGE_SIZE = 200           # Minimum image dimension for filtering
-PARSE_TIMEOUT = 5              # Seconds before parsing is aborted
+
+# Config keys understood by load_config() — must match CLI argument dest names.
+CONFIG_KEYS = {
+    "retries", "timeout", "wait", "headed", "proxy", "geoip",
+    "fingerprint", "persistent", "user_agent", "zip", "verbose",
+    "max_results", "max_pages", "max_reviews", "cache", "cache_dir",
+    "cache_ttl", "profile_dir", "domain",
+}
+
+
+def load_config(path: str = "config.yaml") -> dict:
+    """Load a YAML config file into a dict of CLI default values.
+
+    Returns an empty dict when the file is missing, unreadable, or contains
+    no mapping — the CLI then falls back to its built-in defaults.
+    """
+    config_path = Path(path)
+    if not config_path.exists():
+        return {}
+    try:
+        import yaml
+    except ImportError:
+        log.warning("config file %s present but PyYAML is not installed; ignoring", config_path)
+        return {}
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError) as e:
+        log.warning("Could not read config file %s: %s", config_path, e)
+        return {}
+    if not isinstance(data, dict):
+        log.warning("Config file %s does not contain a mapping; ignoring", config_path)
+        return {}
+    return data

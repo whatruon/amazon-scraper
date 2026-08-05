@@ -2,24 +2,38 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Optional
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import Page
 
-from .models import Product
+from .config import COUPON_SELECTORS, DEAL_SELECTORS, ORIGINAL_PRICE_SELECTORS
 from .parser import extract_price
-from .config import ORIGINAL_PRICE_SELECTORS, DEAL_SELECTORS, COUPON_SELECTORS
 
 log = logging.getLogger(__name__)
 
 
-def track_price(page: Page) -> dict:
+class TrackPriceError(ValueError):
+    """Raised when track_price() cannot determine what to parse."""
+
+
+# Currency symbols Amazon renders prices with, matched as a character class.
+_CURRENCY_SYMBOL = r"[$£€¥₹]"
+
+# Price-like substrings for fallback extraction: prefix symbols (with optional
+# space, incl. multi-char like 'CDN$') and EU-style trailing symbols.
+_AMOUNT_RE = (
+    r"(?:US\$|CDN\$|MX\$|R\$|A\$|C\$|S\$|HK\$|₹|€|£|¥|\$)\s*\d+(?:[.,]\d{1,3})*(?:[.,]\d{1,2})?"
+    r"|\d+(?:\.\d{3})*(?:,\d{1,2})?\s*(?:€|£|¥|₹|\$)"
+)
+
+
+def track_price(page: Page | None = None, soup: BeautifulSoup | None = None) -> dict:
     """
     Extract price and deal information from Amazon product page.
 
     Args:
-        page: Playwright Page object
+        page: Playwright Page object. Required when *soup* is not provided.
+        soup: Pre-parsed product-page HTML. Required when *page* is not provided.
 
     Returns:
         Dictionary containing price information:
@@ -30,58 +44,72 @@ def track_price(page: Page) -> dict:
         - is_on_sale: Boolean indicating if product is on sale
         - savings_amount: Amount saved if on sale
     """
+    if soup is None:
+        if page is None:
+            msg = "track_price() requires a page or a soup"
+            raise TrackPriceError(msg)
+        soup = BeautifulSoup(page.content(), "lxml")
+
+    # Extract current price using the standardized parser logic (reuses
+    # PRICE_SELECTORS, with a browser-JS fallback when the page has no static HTML).
     price_info = {
-        'current_price': None,
+        'current_price': extract_price(soup, page),
         'original_price': None,
         'discount_percentage': None,
         'deal_type': None,
         'is_on_sale': False,
-        'savings_amount': None
+        'savings_amount': None,
     }
 
-    try:
-        # Get page content
-        content = page.content()
-        soup = BeautifulSoup(content, "lxml")
-
-        # Extract current price using existing parser logic
-        current_price = _extract_current_price(soup, page)
-        if current_price:
-            price_info['current_price'] = current_price
-
-        # Check for original price (list price/was price)
-        original_price = _extract_original_price(soup)
-        if original_price:
-            price_info['original_price'] = original_price
-
-        # Check for deal/badges
-        deal_info = _extract_deal_info(soup)
-        price_info.update(deal_info)
-
-        # Calculate discount if we have both prices
-        if price_info['current_price'] and price_info['original_price']:
-            try:
-                current_val = float(re.sub(r'[^\d.]', '', price_info['current_price']))
-                original_val = float(re.sub(r'[^\d.]', '', price_info['original_price']))
-                if original_val > current_val:
-                    savings = original_val - current_val
-                    currency_match = re.search(r'^([$£€¥₹])', price_info['current_price'])
-                    currency_sym = currency_match.group(1) if currency_match else '$'
-                    price_info['savings_amount'] = f"{currency_sym}{savings:.2f}"
-                    price_info['discount_percentage'] = f"{int((savings / original_val) * 100)}%"
-                    price_info['is_on_sale'] = True
-            except ValueError:
-                pass
-
-    except Exception:
-        pass
+    price_info['original_price'] = _extract_original_price(soup)
+    price_info.update(_extract_deal_info(soup))
+    _apply_discount(price_info)
 
     return price_info
 
 
-def _extract_current_price(soup: BeautifulSoup, page) -> str | None:
-    """Extract current price using existing parser logic."""
-    return extract_price(soup, page)
+def _to_amount(text: str | None) -> float | None:
+    """Parse a price string (e.g. '$29.99', '29,99', '1.234,56') into a float.
+
+    Handles both US formats (dot decimal / comma thousands) and EU formats
+    (comma decimal / dot thousands). Returns None if the text is not a
+    well-formed price.
+    """
+    if not text:
+        return None
+    digits = re.sub(r"[^\d.,]", "", text)
+    if not digits:
+        return None
+    if "," in digits:
+        # EU: '29,99' or '1.234,56'
+        if re.fullmatch(r"\d+(?:\.\d{3})*(?:,\d{1,2})?", digits):
+            return float(digits.replace(".", "").replace(",", "."))
+        # US: '1,299.99'
+        if re.fullmatch(r"\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?", digits):
+            return float(digits.replace(",", ""))
+        return None
+    # No comma: US plain '29.99' / '1000' or EU whole thousands '1.234'
+    if re.fullmatch(r"\d+(?:\.\d{1,2})?", digits):
+        return float(digits)
+    if re.fullmatch(r"\d{1,3}(?:\.\d{3})+", digits):
+        return float(digits.replace(".", ""))
+    return None
+
+
+def _apply_discount(price_info: dict) -> None:
+    """If both current and original prices are present, compute savings/discount."""
+    current = _to_amount(price_info.get('current_price'))
+    original = _to_amount(price_info.get('original_price'))
+    # No, or equal, prices means nothing to discount.
+    if not current or not original or original <= current:
+        return
+
+    savings = original - current
+    currency_match = re.search(_CURRENCY_SYMBOL, price_info.get('current_price') or '')
+    currency_sym = currency_match.group(0) if currency_match else '$'
+    price_info['savings_amount'] = f"{currency_sym}{savings:.2f}"
+    price_info['discount_percentage'] = f"{int((savings / original) * 100)}%"
+    price_info['is_on_sale'] = True
 
 
 def _extract_original_price(soup: BeautifulSoup) -> str | None:
@@ -90,15 +118,14 @@ def _extract_original_price(soup: BeautifulSoup) -> str | None:
         el = soup.select_one(selector)
         if el:
             text = el.get_text(strip=True)
-            if text and ('$' in text or '₹' in text or '£' in text or '€' in text):
+            if text and re.search(_CURRENCY_SYMBOL, text):
                 return text
 
     # Look for "Was" or "List Price" text patterns
-    was_price_elements = soup.select('.a-text-price')
-    for elem in was_price_elements:
+    for elem in soup.select('.a-text-price'):
         text = elem.get_text(strip=True)
         if 'was' in text.lower() or 'list price' in text.lower():
-            price_match = re.search(r'[\$₹£€]\d+(?:,\d{3})*(?:\.\d{2})?', text)
+            price_match = re.search(_AMOUNT_RE, text)
             if price_match:
                 return price_match.group(0)
 

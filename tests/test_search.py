@@ -1,12 +1,17 @@
-"""Tests for search_amazon orchestration with mocked browser session."""
+"""Tests for search_amazon orchestration with mocked browser session."""  # noqa: INP001
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
-from scraper.search import search_amazon
+from scraper.errors import CaptchaError
 from scraper.models import SearchResult
+from scraper.search import search_amazon
+
+# search_amazon fetches at most this many pages by default; each fetched page
+# triggers exactly one CAPTCHA probe in _handle_captcha_if_present.
+MAX_PAGES = 3
 
 
 @pytest.fixture
@@ -105,6 +110,30 @@ class TestSearch:
 
         assert len(urls) == 2
 
+    def test_no_sleep_when_max_results_reached(self, mock_session, mock_page, monkeypatch):
+        """The inter-page rate-limit sleep must be skipped once max_results is hit."""
+        import scraper.search as search_mod
+
+        search_html = """
+        <html><body>
+            <div data-component-type="s-search-result">
+                <h2><a class="a-link-normal s-no-outline" href="/dp/B0TEST1"><span>P1</span></a></h2>
+            </div>
+            <div data-component-type="s-search-result">
+                <h2><a class="a-link-normal s-no-outline" href="/dp/B0TEST2"><span>P2</span></a></h2>
+            </div>
+        </body></html>
+        """
+        mock_page.content.return_value = search_html
+
+        def _no_sleep(_seconds):
+            pytest.fail("sleep must not be called when max_results reached")
+
+        monkeypatch.setattr(search_mod.time, "sleep", _no_sleep)
+
+        results = search_amazon(mock_session, "nosleep", max_results=2, verbose=False)
+        assert len(results) == 2
+
     def test_search_uses_correct_url(self, mock_session, mock_page):
         """Verify the constructed search URL contains the query."""
         mock_page.content.return_value = "<html><body>no results</body></html>"
@@ -168,7 +197,7 @@ class TestSearchErrors:
         # Only return captcha_btn for the first page's CAPTCHA check.
         # Subsequent pages (same mock) get None so only one click fires.
         captcha_btn = MagicMock()
-        mock_page.query_selector.side_effect = [captcha_btn] + [None] * 20
+        mock_page.query_selector.side_effect = [captcha_btn] + [None] * MAX_PAGES
 
         search_html = """
         <html><body>
@@ -193,6 +222,68 @@ class TestSearchErrors:
         assert urls == []
         # Only one page should be fetched before breaking
         assert mock_page.goto.call_count == 1
+
+    def test_fetch_search_page_retries_on_failure(self, monkeypatch):
+        """_fetch_search_page must retry failed fetches with fresh pages."""
+        import scraper.search as search_mod
+        from scraper.search import _fetch_search_page
+
+        monkeypatch.setattr(search_mod.time, "sleep", lambda _s: None)
+
+        session = MagicMock()
+        session.domain = "www.amazon.com"
+
+        pages = []
+        for _ in range(3):
+            p = MagicMock()
+            p.query_selector.return_value = None
+            p.content.return_value = "<html><body>ok</body></html>"
+            pages.append(p)
+
+        pages[0].goto.side_effect = Exception("boom 1")
+        pages[1].goto.side_effect = Exception("boom 2")
+        session.new_page.side_effect = pages
+
+        html = _fetch_search_page(
+            session,
+            "https://www.amazon.com/s?k=retry",
+            timeout=15000,
+            wait=0,
+            verbose=False,
+            retries=3,
+        )
+
+        assert html == "<html><body>ok</body></html>"
+        assert session.new_page.call_count == 3
+        assert pages[0].goto.call_count == 1
+        assert pages[1].goto.call_count == 1
+        assert pages[2].goto.call_count == 1
+
+    def test_unresolved_captcha_raises_captcha_error(self, monkeypatch):
+        """An unresolved CAPTCHA must surface as CaptchaError after retries."""
+        import scraper.search as search_mod
+        from scraper.search import _fetch_search_page
+
+        monkeypatch.setattr(search_mod.time, "sleep", lambda _s: None)
+
+        session = MagicMock()
+        session.domain = "www.amazon.com"
+
+        page = MagicMock()
+        captcha_btn = MagicMock()
+        page.query_selector.return_value = captcha_btn
+        page.wait_for_selector.side_effect = Exception("still captcha")
+        session.new_page.return_value = page
+
+        with pytest.raises(CaptchaError):
+            _fetch_search_page(
+                session,
+                "https://www.amazon.com/s?k=test",
+                timeout=15000,
+                wait=0,
+                verbose=False,
+                retries=1,
+            )
 
 
 # ------------------------------------------------------------------

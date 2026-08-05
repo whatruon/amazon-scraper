@@ -1,18 +1,30 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
 import os
+import re
 import tempfile
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
 
 log = logging.getLogger(__name__)
 
 CACHE_VERSION = "1"
+
+# Leftover temp files (from interrupted atomic_write calls) older than this are
+# swept on the next cache operation, so crashed writes never accumulate.
+ORPHAN_TMP_MAX_AGE = 3600  # seconds
+
+_TMP_PREFIX = ".tmp-"
+_TMP_SUFFIX = ".tmp"
+
+# Names of the files this cache manages: <64-hex sha256>.html / .meta.json.
+_CACHE_KEY_RE = re.compile(r"^[0-9a-f]{64}\.html$")
+_CACHE_META_RE = re.compile(r"^[0-9a-f]{64}\.meta\.json$")
 
 
 @dataclass
@@ -21,6 +33,10 @@ class CacheEntry:
     cached_at: float  # Unix timestamp
     ttl_seconds: int
     version: str = CACHE_VERSION
+
+
+class CacheWriteError(OSError):
+    """Internal error raised when an atomic file write cannot complete."""
 
 
 class HtmlCache:
@@ -48,12 +64,12 @@ class HtmlCache:
     # Public API
     # ------------------------------------------------------------------
 
-    def get(self, url: str) -> Optional[str]:
+    def get(self, url: str) -> str | None:
         """Return cached HTML for *url*, or None if not cached / expired."""
         key = self._key(url)
-        # Cleanup any orphaned temp files from previous crashes
-        for p in self._dir.glob(f"{key}*.tmp"):
-            p.unlink(missing_ok=True)
+        # Cleanup orphaned temp files (including any for this entry) left by
+        # interrupted atomic_write calls.
+        self._cleanup_temps(key)
         html_path = self._html_path(key)
         meta_path = self._meta_path(key)
 
@@ -123,7 +139,12 @@ class HtmlCache:
         if not self._dir.exists():
             return
         for path in list(self._dir.iterdir()):
-            if path.suffix == ".html" or path.name.endswith(".meta.json"):
+            name = path.name
+            if (
+                _CACHE_KEY_RE.fullmatch(name)
+                or _CACHE_META_RE.fullmatch(name)
+                or name.startswith(_TMP_PREFIX)
+            ):
                 path.unlink(missing_ok=True)
 
     def stats(self) -> dict:
@@ -135,8 +156,12 @@ class HtmlCache:
             for path in self._dir.iterdir():
                 if path.suffix != ".html":
                     continue
+                try:
+                    total_bytes += path.stat().st_size
+                except OSError:
+                    # File vanished between listing and stat — skip it.
+                    continue
                 total += 1
-                total_bytes += path.stat().st_size
                 meta_path = self._meta_path(path.stem)
                 entry = self._read_meta(meta_path)
                 if entry and self._is_expired(entry):
@@ -154,6 +179,16 @@ class HtmlCache:
             "cache_dir": str(self._dir),
             "ttl_seconds": self._ttl,
         }
+
+    def cached_at(self, url: str) -> float | None:
+        """Return the cached_at timestamp stored for *url*, or None.
+
+        Returns None when the entry is absent, corrupted, or its meta file
+        cannot be read. Only the meta file is consulted — the HTML is never
+        read here.
+        """
+        entry = self._read_meta(self._meta_path(self._key(url)))
+        return entry.cached_at if entry else None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -175,12 +210,30 @@ class HtmlCache:
     def _remove(self, key: str) -> None:
         self._html_path(key).unlink(missing_ok=True)
         self._meta_path(key).unlink(missing_ok=True)
-        # Cleanup any orphaned temp files
-        for p in self._dir.glob(f"{key}*.tmp"):
-            p.unlink(missing_ok=True)
+        self._cleanup_temps(key)
+
+    def _cleanup_temps(self, key: str | None = None) -> None:
+        """Remove orphaned temp files left by interrupted atomic_write calls.
+
+        Temp files for *key* (identifiable because their name embeds the target
+        filename) are removed unconditionally. Any other leftover ``*.tmp`` file
+        older than ORPHAN_TMP_MAX_AGE is swept as a safety net, so a crashed
+        write for an entry that is never touched again still gets cleaned up.
+        Fresh foreign temps are preserved so a concurrent in-progress write is
+        never disturbed.
+        """
+        if not self._dir.exists():
+            return
+        cutoff = time.time() - ORPHAN_TMP_MAX_AGE
+        marker = f".{key}." if key else None
+        for p in self._dir.glob(f"*{_TMP_SUFFIX}"):
+            with contextlib.suppress(OSError):
+                is_target = marker is not None and marker in p.name
+                if is_target or p.stat().st_mtime < cutoff:
+                    p.unlink(missing_ok=True)
 
     @staticmethod
-    def _read_meta(path: Path) -> Optional[CacheEntry]:
+    def _read_meta(path: Path) -> CacheEntry | None:
         try:
             raw = path.read_text(encoding="utf-8")
             data = json.loads(raw)
@@ -189,18 +242,63 @@ class HtmlCache:
             return None
 
     @staticmethod
-    def _read_html(path: Path) -> Optional[str]:
+    def _read_html(path: Path) -> str | None:
         try:
             return path.read_text(encoding="utf-8")
         except OSError:
             return None
 
 
+def _write_all(fd: int, data: bytes, tmp: str) -> None:
+    """Write *data* to *fd* in full, fsyncing, and raise on a short write."""
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            msg = f"short write while writing to {tmp}"
+            raise CacheWriteError(msg)
+        view = view[written:]
+    os.fsync(fd)
+
+
+def _fsync_dir(directory: Path) -> None:
+    """Best-effort fsync of *directory* so a completed rename is durable."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        # Directories cannot be opened as files on some platforms.
+        return
+    with contextlib.suppress(OSError):
+        os.fsync(fd)
+    os.close(fd)
+
+
 def atomic_write(path: Path, content: str) -> None:
     """Atomically write *content* to *path* via tempfile + rename."""
-    fd, tmp = tempfile.mkstemp(suffix=".tmp", dir=path.parent)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # The target filename is embedded in the temp name so cache cleanup can
+    # find leftovers; the prefix stays short for platform portability.
+    fd, tmp = tempfile.mkstemp(
+        prefix=_TMP_PREFIX,
+        suffix=f".{path.name}{_TMP_SUFFIX}",
+        dir=path.parent,
+    )
     try:
-        os.write(fd, content.encode("utf-8"))
+        _write_all(fd, content.encode("utf-8"), tmp)
+    except Exception:
+        # Never leave the temp file behind when writing/fsync failed.
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
     finally:
         os.close(fd)
-    Path(tmp).rename(path)
+    try:
+        # os.replace is atomic on the same filesystem and works on Windows too.
+        os.replace(tmp, path)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    # Make the rename itself durable once the file is in place.
+    _fsync_dir(path.parent)
